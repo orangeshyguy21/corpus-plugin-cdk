@@ -59,6 +59,12 @@ Protocol additions land in Corpus with a conformance fixture first. This
 plugin then adopts the released contract; Corpus raises its required plugin
 version only after a compatible plugin release exists.
 
+While both repositories are private, CI uses a `CORPUS_PLUGIN_TOKEN`
+repository secret for the cross-repository checkout. Use a fine-grained token
+limited to read-only Contents access on `corpus` and `corpus-plugin-cdk`, and
+store the same secret name in both repositories. Remove it when the repositories
+become public.
+
 The adapter originated in the Corpus monorepo. Its directory history was
 preserved when this repository was extracted. CDK and Cashu are upstream
 projects and retain their respective licenses; no upstream source is vendored
