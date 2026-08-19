@@ -13,6 +13,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: orangeshyguy21/corpus
+          ref: plugins
           path: corpus
           token: ${{ secrets.CORPUS_PLUGIN_TOKEN }}
       - run: scripts/conformance.sh "$GITHUB_WORKSPACE/corpus"
