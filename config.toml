@@ -25,8 +25,8 @@ network = "corpus-arena"
 egress_network = "corpus-arena-egress"
 
 [target]
-# Attacks run against the host regtest environment (`just regtest` in the
-# cdk repo). Inside the arena, 127.0.0.1/localhost is rewritten to
+# Attacks run against the host regtest environment owned or adopted by plugin
+# setup. Inside the arena, 127.0.0.1/localhost is rewritten to
 # host.docker.internal; agents reach the targets via the corpus-target-gw
 # gateway. Hard isolation lands when targets move into the arena themselves.
 mint_url = "http://127.0.0.1:8085"

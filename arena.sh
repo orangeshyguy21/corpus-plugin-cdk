@@ -10,7 +10,7 @@ set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${CORPUS_CONFIG:-$PLUGIN_DIR/config.toml}"
-AGENT_IMAGE="${CORPUS_AGENT_IMAGE:-corpus-cdk-agent:0.3.0}"
+AGENT_IMAGE="${CORPUS_AGENT_IMAGE:-corpus-cdk-agent:0.3.7}"
 GW_NAME="${CORPUS_GATEWAY_NAME:-corpus-cdk-gateway-dev}"
 SANDBOX_NAME="${CORPUS_SANDBOX_NAME:-corpus-cdk-sandbox-dev}"
 EVIDENCE_DIR="${CORPUS_EVIDENCE_DIR:-${TMPDIR:-/tmp}/corpus-cdk-dev/evidence}"
@@ -289,6 +289,7 @@ source_mount_args() {
             || die "source $name at $tree does not match declared sha $sha"
         args+=(-v "$tree:$mount:ro")
     done < <(jq -c '.[]' <<<"$SOURCES_JSON")
+    [ "${#args[@]}" -gt 0 ] || die "session has no resolved source mounts"
     printf '%s\n' "${args[@]}"
 }
 

@@ -8,7 +8,7 @@ CONF="$PLUGIN_DIR/config.toml"
 ORACLES_DIR="$PLUGIN_DIR/oracles"
 EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-90}"
 ORACLE_TIMEOUT_SECS="${CORPUS_ORACLE_TIMEOUT_SECS:-90}"
-AGENT_IMAGE="corpus-cdk-agent:0.3.2"
+AGENT_IMAGE="corpus-cdk-agent:0.3.7"
 
 reply_ok() { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
 reply_error() {
@@ -52,6 +52,13 @@ hash12() {
         printf '%s' "$1" | sha256sum | awk '{print substr($1,1,12)}'
     fi
 }
+sha256() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    else
+        sha256sum | awk '{print $1}'
+    fi
+}
 atomic_json() {
     local path="$1" value="$2" tmp
     tmp="$path.tmp.$$"
@@ -78,6 +85,8 @@ load_lifecycle_context() {
     SOURCES_JSON="$(jq -c '.sources // []' <<<"$1")"
     [ -n "$STATE_DIR" ] && [ "${STATE_DIR#/}" != "$STATE_DIR" ] || return 1
     TOOLS_DIR="$STATE_DIR/tools"
+    BACKBONE_DIR="$STATE_DIR/backbone"
+    BACKBONE_RECORD="$STATE_DIR/backbone.json"
     mkdir -p "$STATE_DIR/operations"
 }
 load_session_context() {
@@ -86,6 +95,9 @@ load_session_context() {
     STATE_DIR="$(jq -r '.state_dir // ""' <<<"$params")"
     SOURCES_JSON="$(jq -c '.sources // []' <<<"$params")"
     [ -n "$STATE_DIR" ] && [ "${STATE_DIR#/}" != "$STATE_DIR" ] || return 1
+    if [ -f "$STATE_DIR/session.json" ] && [ "$(jq -r '.session_id // ""' "$STATE_DIR/session.json")" = "$SESSION_ID" ]; then
+        SOURCES_JSON="$(jq -c '.sources // []' "$STATE_DIR/session.json")"
+    fi
     suffix="$(hash12 "$SESSION_ID")"
     RUNTIME_DIR="$(dirname "$(dirname "$STATE_DIR")")"
     TOOLS_DIR="$RUNTIME_DIR/tools"
@@ -96,6 +108,65 @@ load_session_context() {
     GATEWAY_NAME="corpus-cdk-gateway-$suffix"
     SANDBOX_NAME="corpus-cdk-sandbox-$suffix"
     mkdir -p "$STATE_DIR/operations" "$EVIDENCE_DIR"
+}
+targets_ready() {
+    curl -sf --max-time 3 "$(config_get target mint_url)/v1/info" >/dev/null 2>&1 &&
+        curl -sf --max-time 3 "$(config_get target mint_url_2)/v1/info" >/dev/null 2>&1
+}
+external_work_dir() {
+    local env_file=/tmp/cdk_regtest_env line
+    [ -f "$env_file" ] || return 0
+    line="$(grep -E '^(export[[:space:]]+)?CDK_ITESTS_DIR=' "$env_file" | tail -1 || true)"
+    line="${line#export }"; line="${line#CDK_ITESTS_DIR=}"; line="${line%\"}"; line="${line#\"}"; line="${line%\'}"; line="${line#\'}"
+    printf '%s' "$line"
+}
+backbone_work_dir() {
+    if [ -f "$RUNTIME_DIR/backbone.json" ]; then
+        jq -r '.work_dir // ""' "$RUNTIME_DIR/backbone.json"
+    else
+        external_work_dir
+    fi
+}
+start_backbone() {
+    local cdk_source="$1" pid log mint_addr mint_port_1 mint_port_2 waited=0
+    command -v nix >/dev/null 2>&1 || { printf '%s' "nix is required to start the pinned CDK regtest"; return 1; }
+    mkdir -p "$BACKBONE_DIR"
+    log="$STATE_DIR/backbone.log"
+    mint_addr="127.0.0.1"; mint_port_1="$(url_port "$(config_get target mint_url)")"; mint_port_2="$(url_port "$(config_get target mint_url_2)")"
+    nohup nix run "$cdk_source#start-regtest-mints" -- \
+        --enable-logging sqlite "$BACKBONE_DIR" "$mint_addr" "$mint_port_1" "$mint_port_2" \
+        >"$log" 2>&1 </dev/null &
+    pid=$!
+    atomic_json "$BACKBONE_RECORD" "$(jq -nc --argjson pid "$pid" --arg work_dir "$BACKBONE_DIR" --arg log "$log" '{ownership:"plugin",pid:$pid,work_dir:$work_dir,log:$log,state:"starting"}')"
+    while [ "$waited" -lt 300 ]; do
+        if targets_ready && [ -f "$BACKBONE_DIR/.ready" ]; then
+            atomic_json "$BACKBONE_RECORD" "$(jq '.state="ready"' "$BACKBONE_RECORD")"
+            return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            printf 'CDK regtest exited during startup; see %s' "$log"
+            return 1
+        fi
+        sleep 1; waited=$((waited+1))
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+    printf 'CDK regtest did not become ready within 300 seconds; see %s' "$log"
+    return 1
+}
+stop_backbone() {
+    local pid command waited=0
+    [ -f "$BACKBONE_RECORD" ] || return 0
+    [ "$(jq -r '.ownership // ""' "$BACKBONE_RECORD")" = plugin ] || { rm -f "$BACKBONE_RECORD"; return 0; }
+    pid="$(jq -r '.pid // ""' "$BACKBONE_RECORD")"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    if kill -0 "$pid" 2>/dev/null; then
+        command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+        case "$command" in *"$BACKBONE_DIR"*) ;; *) return 1 ;; esac
+        kill -TERM "$pid" 2>/dev/null || true
+        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited+1)); done
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$BACKBONE_RECORD"
 }
 run_arena() {
     CORPUS_AGENT_IMAGE="$AGENT_IMAGE" CORPUS_ARENA_NETWORK="$ARENA_NETWORK" \
@@ -120,7 +191,7 @@ docker_error() {
     else printf '%s' daemon_unavailable; fi
 }
 doctor_result() {
-    local state="$1" mint1 mint2 ready=true image_digest=""; local notes=()
+    local state="$1" mint1 mint2 ready=true image_digest="" ownership="absent"; local notes=()
     if [ "$(docker_error)" != ready ]; then ready=false; notes+=("docker $(docker_error)"); fi
     docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1 || { ready=false; notes+=("attacker image missing"); }
     [ -x "$state/tools/cdk-cli" ] || { ready=false; notes+=("cdk-cli missing"); }
@@ -128,22 +199,23 @@ doctor_result() {
     mint1="$(config_get target mint_url)"; mint2="$(config_get target mint_url_2)"
     curl -sf --max-time 3 "$mint1/v1/info" >/dev/null 2>&1 || { ready=false; notes+=("mint-1 unreachable"); }
     curl -sf --max-time 3 "$mint2/v1/info" >/dev/null 2>&1 || { ready=false; notes+=("mint-2 unreachable"); }
+    [ -f "$state/backbone.json" ] && ownership="$(jq -r '.ownership // "unknown"' "$state/backbone.json")"
     image_digest="$(docker image inspect "$AGENT_IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
     local joined=ready; [ "${#notes[@]}" -gt 0 ] && joined="$(IFS=', '; echo "${notes[*]}")"
-    jq -nc --argjson ready "$ready" --arg notes "$joined" --arg image_digest "$image_digest" \
-        '{ready:$ready,notes:$notes,docker:{required:true},image_digest:$image_digest}'
+    jq -nc --argjson ready "$ready" --arg notes "$joined" --arg image_digest "$image_digest" --arg ownership "$ownership" \
+        '{ready:$ready,notes:$notes,docker:{required:true},image_digest:$image_digest,backbone:{ownership:$ownership}}'
 }
 
 handle_setup() {
     local id="$1" params="$2" key result cdk_source out
     load_lifecycle_context "$params" || { reply_error "$id" invalid_context "setup requires an absolute state_dir" false; return; }
-    key="$(jq -r '.idempotency_key // "setup:cdk-regtest:0.3.2"' <<<"$params")"
-    progress "$id" dependency_fetch "default source locks verified" 1 4
+    key="$(jq -r '.idempotency_key // "setup:cdk-regtest:0.3.7"' <<<"$params")"
+    progress "$id" dependency_fetch "default source locks verified" 1 5
     cdk_source="$(jq -r '.sources[]? | select(.id=="cdk") | .host_path' <<<"$params" | head -1)"
     [ -d "$cdk_source/.git" ] || { operation_failure "$key" source_missing "CDK source was not materialized by Corpus" true; reply_error "$id" source_missing "CDK source was not materialized by Corpus" true; return; }
-    progress "$id" image_build "building attacker image" 2 4
+    progress "$id" image_build "building attacker image" 2 5
     if ! out="$(CORPUS_AGENT_IMAGE="$AGENT_IMAGE" "$ARENA" build 2>&1)"; then operation_failure "$key" image_build_failed "$out" true; reply_error "$id" image_build_failed "$out" true; return; fi
-    progress "$id" tool_build "building cdk-cli and host faucet" 3 4; mkdir -p "$TOOLS_DIR"
+    progress "$id" tool_build "building cdk-cli and host faucet" 3 5; mkdir -p "$TOOLS_DIR"
     if [ ! -x "$TOOLS_DIR/cdk-cli" ]; then
         if ! out="$(CORPUS_CDK_REPO="$cdk_source" CORPUS_TOOLS_DIR="$TOOLS_DIR" "$PLUGIN_DIR/tools/build-tools.sh" 2>&1)"; then operation_failure "$key" tool_build_failed "$out" true; reply_error "$id" tool_build_failed "$out" true; return; fi
     fi
@@ -151,7 +223,15 @@ handle_setup() {
         if ! CARGO_TARGET_DIR="$STATE_DIR/faucet-target" cargo build --manifest-path "$PLUGIN_DIR/faucet-src/Cargo.toml" --release >/dev/null 2>&1; then operation_failure "$key" faucet_build_failed "could not build corpus-faucet" true; reply_error "$id" faucet_build_failed "could not build corpus-faucet" true; return; fi
         cp "$STATE_DIR/faucet-target/release/corpus-faucet" "$STATE_DIR/corpus-faucet"; chmod 755 "$STATE_DIR/corpus-faucet"
     fi
-    progress "$id" verification "checking Docker, tools, targets, and oracle prerequisites" 4 4
+    progress "$id" target_start "starting pinned CDK regtest when absent" 4 5
+    if targets_ready; then
+        if [ ! -f "$BACKBONE_RECORD" ]; then
+            atomic_json "$BACKBONE_RECORD" "$(jq -nc --arg work_dir "$(external_work_dir)" '{ownership:"adopted",work_dir:$work_dir,state:"ready"}')"
+        fi
+    elif ! out="$(start_backbone "$cdk_source")"; then
+        operation_failure "$key" target_start_failed "$out" true; reply_error "$id" target_start_failed "$out" true; return
+    fi
+    progress "$id" verification "checking Docker, tools, targets, and oracle prerequisites" 5 5
     result="$(doctor_result "$STATE_DIR")"
     if [ "$(jq -r '.ready' <<<"$result")" != true ]; then operation_failure "$key" verification_failed "$(jq -r '.notes' <<<"$result")" true; reply_error "$id" verification_failed "$(jq -r '.notes' <<<"$result")" true; return; fi
     operation_success "$key" "$result"; reply_ok "$id" "$result"
@@ -163,7 +243,7 @@ handle_session_open() {
     [ "$(jq 'length' <<<"$SOURCES_JSON")" -gt 0 ] || { reply_error "$id" source_missing "session has no resolved sources" false; return; }
     if ! out="$(run_arena up 2>&1)"; then [ -n "$key" ] && operation_failure "$key" session_open_failed "$out" true; reply_error "$id" session_open_failed "$out" true; return; fi
     image_digest="$(docker image inspect "$AGENT_IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
-    lock="sha256:$(hash12 "$(cat "$PLUGIN_DIR/environment.lock")|$SOURCES_JSON|$image_digest")"
+    lock="sha256:$(printf '%s' "$(cat "$PLUGIN_DIR/environment.lock")|$SOURCES_JSON|$image_digest" | sha256)"
     result="$(jq -nc --arg environment_lock "$lock" --arg image_digest "$image_digest" '{ready:true,environment_lock:$environment_lock,image_digest:$image_digest}')"
     atomic_json "$STATE_DIR/session.json" "$(jq -nc --arg session_id "$SESSION_ID" --arg network "$ARENA_NETWORK" --arg egress_network "$EGRESS_NETWORK" --arg gateway "$GATEWAY_NAME" --arg sandbox "$SANDBOX_NAME" --arg image_digest "$image_digest" --argjson sources "$SOURCES_JSON" '{session_id:$session_id,state:"ready",network:$network,egress_network:$egress_network,gateway:$gateway,sandbox:$sandbox,image_digest:$image_digest,sources:$sources}')"
     [ -n "$key" ] && operation_success "$key" "$result"; reply_ok "$id" "$result"
@@ -179,8 +259,15 @@ handle() {
         hello) reply_ok "$id" '{"protocol":"corpus.environment/1","capabilities":["sessions","sandbox.exec","faucet.bolt11","wallet.fund","oracle.run","lifecycle.setup"]}' ;;
         operation_status)
             load_lifecycle_context "$params" || { reply_error "$id" invalid_context "operation_status requires state_dir" false; return; }
-            local op_key op_file; op_key="$(jq -r '.idempotency_key // ""' <<<"$params")"; op_file="$(operation_file "$op_key")"
-            if [ -f "$op_file" ]; then reply_ok "$id" "$(cat "$op_file")"; else reply_ok "$id" "$(jq -nc --arg key "$op_key" '{idempotency_key:$key,state:"unknown"}')"; fi ;;
+            local op_key op_file op_value; op_key="$(jq -r '.idempotency_key // ""' <<<"$params")"; op_file="$(operation_file "$op_key")"
+            if [ -f "$op_file" ]; then
+                op_value="$(cat "$op_file")"
+                if [[ "$op_key" == setup:* ]] && [ "$(jq -r '.state' <<<"$op_value")" = succeeded ] && [ "$(doctor_result "$STATE_DIR" | jq -r '.ready')" != true ]; then
+                    reply_ok "$id" "$(jq -nc --arg key "$op_key" '{idempotency_key:$key,state:"unknown"}')"
+                else
+                    reply_ok "$id" "$op_value"
+                fi
+            else reply_ok "$id" "$(jq -nc --arg key "$op_key" '{idempotency_key:$key,state:"unknown"}')"; fi ;;
         setup) handle_setup "$id" "$params" ;;
         doctor|status)
             load_lifecycle_context "$params" || { reply_error "$id" invalid_context "$method requires state_dir" false; return; }
@@ -190,7 +277,9 @@ handle() {
             load_lifecycle_context "$params" || { reply_error "$id" invalid_context "stop requires state_dir" false; return; }
             local active=0 record gateway sandbox
             for record in "$STATE_DIR"/state/*/session.json; do [ -f "$record" ] || continue; [ "$(jq -r '.state' "$record")" = ready ] || continue; gateway="$(jq -r '.gateway' "$record")"; sandbox="$(jq -r '.sandbox' "$record")"; if docker inspect "$gateway" >/dev/null 2>&1 || docker inspect "$sandbox" >/dev/null 2>&1; then active=$((active+1)); fi; done
-            if [ "$active" -gt 0 ]; then reply_error "$id" sessions_active "$active environment session(s) are still active" true; else reply_ok "$id" '{"stopped":true}'; fi ;;
+            if [ "$active" -gt 0 ]; then reply_error "$id" sessions_active "$active environment session(s) are still active" true
+            elif stop_backbone; then reply_ok "$id" '{"stopped":true}'
+            else reply_error "$id" cleanup_failed "could not stop the plugin-owned CDK regtest" true; fi ;;
         session_open) handle_session_open "$id" "$params" ;;
         session_probe)
             ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
@@ -215,17 +304,17 @@ handle() {
         call_oracle)
             ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
             local name script outfile out rc verdict; name="$(safe_name "$(jq -r '.name // ""' <<<"$params")")" || { reply_error "$id" invalid_args "bad oracle name" false; return; }; script="$ORACLES_DIR/$name.sh"; [ -f "$script" ] || { reply_error "$id" unknown_oracle "unknown oracle: $name" false; return; }
-            outfile="$(mktemp "${TMPDIR:-/tmp}/corpus-cdk-oracle.XXXXXX")"; MINT_URL="$(config_get target mint_url)" MINT_URL_2="$(config_get target mint_url_2)" EVIDENCE_DIR="$EVIDENCE_DIR" run_with_timeout "$ORACLE_TIMEOUT_SECS" "$outfile" bash "$script"; rc=$?; out="$(cat "$outfile" 2>/dev/null)"; rm -f "$outfile"; case "$rc" in 0) verdict=hold ;; 1) verdict=violated ;; *) verdict=inconclusive ;; esac; [ "$rc" -ne 124 ] || out="oracle timed out after ${ORACLE_TIMEOUT_SECS}s; $out"; reply_ok "$id" "$(jq -nc --arg verdict "$verdict" --arg log "$out" '{verdict:$verdict,log:$log}')" ;;
+            outfile="$(mktemp "${TMPDIR:-/tmp}/corpus-cdk-oracle.XXXXXX")"; CDK_ITESTS_DIR="$(backbone_work_dir)" MINT_URL="$(config_get target mint_url)" MINT_URL_2="$(config_get target mint_url_2)" EVIDENCE_DIR="$EVIDENCE_DIR" run_with_timeout "$ORACLE_TIMEOUT_SECS" "$outfile" bash "$script"; rc=$?; out="$(cat "$outfile" 2>/dev/null)"; rm -f "$outfile"; case "$rc" in 0) verdict=hold ;; 1) verdict=violated ;; *) verdict=inconclusive ;; esac; [ "$rc" -ne 124 ] || out="oracle timed out after ${ORACLE_TIMEOUT_SECS}s; $out"; reply_ok "$id" "$(jq -nc --arg verdict "$verdict" --arg log "$out" '{verdict:$verdict,log:$log}')" ;;
         faucet)
             ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
             local op invoice amount memo max out err rc paid tmp_stdout tmp_stderr; op="$(jq -r '.op // ""' <<<"$params")"; invoice="$(jq -r '.call.invoice // ""' <<<"$params")"; amount="$(jq -r '.call.amount_sat // ""' <<<"$params")"; memo="$(jq -r '.call.memo // ""' <<<"$params")"; max="$(config_get faucet max_payment_sats)"; tmp_stdout="$(mktemp)"; tmp_stderr="$(mktemp)"; paid=""
-            case "$op" in pay) CORPUS_FAUCET_MAX_SATS="$max" "$FAUCET" pay "$invoice" >"$tmp_stdout" 2>"$tmp_stderr"; rc=$? ;; invoice) CORPUS_FAUCET_MAX_SATS="$max" "$FAUCET" invoice "$amount" "$memo" >"$tmp_stdout" 2>"$tmp_stderr"; rc=$? ;; balance) "$FAUCET" balance >"$tmp_stdout" 2>"$tmp_stderr"; rc=$? ;; *) rm -f "$tmp_stdout" "$tmp_stderr"; reply_error "$id" invalid_args "unknown faucet op: $op" false; return ;; esac
+            case "$op" in pay) CDK_ITESTS_DIR="$(backbone_work_dir)" CORPUS_FAUCET_MAX_SATS="$max" "$FAUCET" pay "$invoice" >"$tmp_stdout" 2>"$tmp_stderr"; rc=$? ;; invoice) CDK_ITESTS_DIR="$(backbone_work_dir)" CORPUS_FAUCET_MAX_SATS="$max" "$FAUCET" invoice "$amount" "$memo" >"$tmp_stdout" 2>"$tmp_stderr"; rc=$? ;; balance) CDK_ITESTS_DIR="$(backbone_work_dir)" "$FAUCET" balance >"$tmp_stdout" 2>"$tmp_stderr"; rc=$? ;; *) rm -f "$tmp_stdout" "$tmp_stderr"; reply_error "$id" invalid_args "unknown faucet op: $op" false; return ;; esac
             out="$(cat "$tmp_stdout")"; err="$(cat "$tmp_stderr")"; rm -f "$tmp_stdout" "$tmp_stderr"; [ "$rc" -eq 0 ] || { reply_error "$id" faucet_failed "${err:-faucet operation failed}" true; return; }; paid="$(grep -o 'PAID_SATS=[0-9]*' <<<"$out" | cut -d= -f2 | head -1)"; reply_ok "$id" "$(jq -nc --arg text "$out" --arg paid "$paid" '{text:$text,paid_sats:(if $paid=="" then null else ($paid|tonumber) end)}')" ;;
         wallet_fund)
             ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
             local amount target_id target work_dir cli quote invoice quote_id pay claim balance; amount="$(jq -r '.amount_sat // ""' <<<"$params")"; target_id="$(jq -r '.target_id // "mint-1"' <<<"$params")"; case "$amount" in ""|*[!0-9]*) reply_error "$id" invalid_args "amount_sat must be numeric" false; return ;; esac; case "$target_id" in mint-1) target="http://$GATEWAY_NAME:$(url_port "$(config_get target mint_url)")" ;; mint-2) target="http://$GATEWAY_NAME:$(url_port "$(config_get target mint_url_2)")" ;; *) reply_error "$id" invalid_args "unknown target_id: $target_id" false; return ;; esac
             work_dir="/tmp/wallet-$(hash12 "$SESSION_ID-$target_id")"; cli="/opt/tools/cdk-cli -n -w $work_dir"; if [ "$(docker inspect -f '{{.State.Running}}' "$SANDBOX_NAME" 2>/dev/null)" != true ]; then run_arena agent testing --detach -- sleep infinity >/dev/null 2>&1 || { reply_error "$id" sandbox_start_failed "could not start attacker sandbox" true; return; }; fi
-            quote="$(docker exec "$SANDBOX_NAME" timeout "$EXEC_TIMEOUT_SECS" bash -c "rm -rf '$work_dir' && $cli mint '$target' '$amount' --wait-duration 2" 2>&1 || true)"; invoice="$(grep -o 'lnbcrt[^[:space:]]*' <<<"$quote" | head -1)"; quote_id="$(grep -o 'id=[^,[:space:]]*' <<<"$quote" | head -1 | cut -d= -f2)"; [ -n "$invoice" ] && [ -n "$quote_id" ] || { reply_error "$id" quote_failed "mint quote output missing invoice or id: $quote" true; return; }; pay="$(CORPUS_FAUCET_MAX_SATS="$(config_get faucet max_payment_sats)" "$FAUCET" pay "$invoice" 2>&1)" || { reply_error "$id" faucet_failed "$pay" true; return; }; claim="$(docker exec "$SANDBOX_NAME" timeout "$EXEC_TIMEOUT_SECS" bash -c "$cli mint '$target' -q '$quote_id' --wait-duration 15" 2>&1)" || { reply_error "$id" claim_failed "$claim" true; return; }; balance="$(docker exec "$SANDBOX_NAME" timeout "$EXEC_TIMEOUT_SECS" bash -c "$cli balance" 2>&1)" || { reply_error "$id" balance_failed "$balance" true; return; }; reply_ok "$id" "$(jq -nc --argjson amount_sat "$amount" --arg target "$target" --arg claim "$claim" --arg balance "$balance" '{funded:true,amount_sat:$amount_sat,target:$target,claim:$claim,balance:$balance}')" ;;
+            quote="$(docker exec "$SANDBOX_NAME" timeout "$EXEC_TIMEOUT_SECS" bash -c "rm -rf '$work_dir' && $cli mint '$target' '$amount' --wait-duration 2" 2>&1 || true)"; invoice="$(grep -o 'lnbcrt[^[:space:]]*' <<<"$quote" | head -1)"; quote_id="$(grep -o 'id=[^,[:space:]]*' <<<"$quote" | head -1 | cut -d= -f2)"; [ -n "$invoice" ] && [ -n "$quote_id" ] || { reply_error "$id" quote_failed "mint quote output missing invoice or id: $quote" true; return; }; pay="$(CDK_ITESTS_DIR="$(backbone_work_dir)" CORPUS_FAUCET_MAX_SATS="$(config_get faucet max_payment_sats)" "$FAUCET" pay "$invoice" 2>&1)" || { reply_error "$id" faucet_failed "$pay" true; return; }; claim="$(docker exec "$SANDBOX_NAME" timeout "$EXEC_TIMEOUT_SECS" bash -c "$cli mint '$target' -q '$quote_id' --wait-duration 15" 2>&1)" || { reply_error "$id" claim_failed "$claim" true; return; }; balance="$(docker exec "$SANDBOX_NAME" timeout "$EXEC_TIMEOUT_SECS" bash -c "$cli balance" 2>&1)" || { reply_error "$id" balance_failed "$balance" true; return; }; reply_ok "$id" "$(jq -nc --argjson amount_sat "$amount" --arg target "$target" --arg claim "$claim" --arg balance "$balance" '{funded:true,amount_sat:$amount_sat,target:$target,claim:$claim,balance:$balance}')" ;;
         session_close)
             load_session_context "$params" || { reply_error "$id" invalid_context "session_close requires session context" false; return; }
             local key out result; key="$(jq -r '.idempotency_key // empty' <<<"$params")"; if ! out="$(run_arena down 2>&1)"; then [ -n "$key" ] && operation_failure "$key" cleanup_failed "$out" true; reply_error "$id" cleanup_failed "$out" true; return; fi; if [ -f "$STATE_DIR/session.json" ]; then atomic_json "$STATE_DIR/session.json" "$(jq '.state="closed"' "$STATE_DIR/session.json")"; fi; result='{"closed":true}'; [ -n "$key" ] && operation_success "$key" "$result"; reply_ok "$id" "$result" ;;

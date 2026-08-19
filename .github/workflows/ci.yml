@@ -17,8 +17,8 @@ jobs:
       - run: scripts/conformance.sh "$GITHUB_WORKSPACE/corpus"
 
   docker-smoke:
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash -n plugin arena.sh faucet.sh tools/build-tools.sh
+      - run: bash -n plugin arena.sh faucet.sh tools/build-tools.sh scripts/*.sh
+      - run: docker build --tag corpus-cdk-agent:ci --file arena/agent.Dockerfile arena

@@ -15,9 +15,10 @@
 //!   - amountless invoices are refused (unbounded payment);
 //!   - per-payment / per-invoice cap (CORPUS_FAUCET_MAX_SATS, default 100_000 sat).
 //!
-//! Environment (unchanged from faucet.sh): reads /tmp/cdk_regtest_env for
-//! CDK_ITESTS_DIR and connects to $CDK_ITESTS_DIR/cln/two/regtest/lightning-rpc
-//! (override the socket directly with CORPUS_CLN_RPC).
+//! Environment: the plugin supplies its owned/adopted CDK_ITESTS_DIR and this
+//! connects to $CDK_ITESTS_DIR/cln/two/regtest/lightning-rpc (the legacy
+//! /tmp/cdk_regtest_env file remains a development fallback; override the
+//! socket directly with CORPUS_CLN_RPC).
 
 use std::path::Path;
 use std::str::FromStr;
@@ -68,7 +69,7 @@ fn max_sats() -> u64 {
 }
 
 /// Resolve the CLN "two" rpc socket: CORPUS_CLN_RPC wins, else derive it from
-/// CDK_ITESTS_DIR (env, else sourced from /tmp/cdk_regtest_env).
+/// CDK_ITESTS_DIR (env, else sourced from legacy /tmp/cdk_regtest_env).
 fn rpc_path() -> Result<String> {
     if let Ok(p) = std::env::var("CORPUS_CLN_RPC") {
         if !p.is_empty() {

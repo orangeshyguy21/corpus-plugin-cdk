@@ -3,5 +3,6 @@
 /tools/cdk-cli
 /faucet-src/target/
 /.artifacts/
+.DS_Store
 *.tmp
 *.partial

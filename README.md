@@ -25,11 +25,17 @@ and session paths. Mission launch opens a durable environment session; Stop
 closes it. `tmux` belongs to the Corpus run frontend and is not required by
 this plugin.
 
-Docker Desktop or OrbStack, `jq`, `curl`, and Bash are required. Setup builds
-the shared attacker image and CDK client into Corpus-owned runtime state. The
-CDK regtest mints must answer on the configured host ports; session-specific
-gateway, network, sandbox, evidence, and wallet resources are created and
-removed by the plugin.
+Docker Desktop or OrbStack, Nix, `jq`, `curl`, and Bash are required. Setup
+builds the shared attacker image and CDK client into Corpus-owned runtime
+state. When the configured mint ports are unused it launches CDK's pinned,
+non-interactive `start-regtest-mints` flake app and records the process and
+working tree beneath plugin state. If compatible mints are already listening,
+setup adopts them without taking teardown ownership. Session-specific gateway,
+network, sandbox, evidence, and wallet resources are created and removed by
+the plugin.
+
+`corpus plugin stop cdk-regtest` refuses while sessions are live, then stops
+only a backbone launched by this plugin. An adopted backbone is never killed.
 
 ## Trust boundary
 
