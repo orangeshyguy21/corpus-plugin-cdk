@@ -1,6 +1,6 @@
 manifest_version = 1
 id = "cdk-regtest"
-version = "0.3.7"
+version = "0.3.8"
 description = "Session-scoped CDK Cashu regtest environment"
 protocol = "corpus.environment/1"
 exec = "plugin"

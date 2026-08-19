@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.7 — 2026-08-18
+## 0.3.8 — 2026-08-18
 
 - Let lifecycle setup start CDK's pinned non-interactive regtest when targets
   are absent, while safely adopting but never stopping an existing backbone.
@@ -9,6 +9,8 @@
 - Reload resolved source mounts from the durable session record on every call,
   so an incomplete caller cannot weaken or erase the opened session context.
 - Make the CI Docker smoke job build the attacker image on every change.
+- Emit portable checksum files containing the release archive basename rather
+  than a build-machine absolute path.
 
 ## 0.3.2 — 2026-08-18
 

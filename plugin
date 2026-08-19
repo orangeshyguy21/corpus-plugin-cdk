@@ -8,7 +8,7 @@ CONF="$PLUGIN_DIR/config.toml"
 ORACLES_DIR="$PLUGIN_DIR/oracles"
 EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-90}"
 ORACLE_TIMEOUT_SECS="${CORPUS_ORACLE_TIMEOUT_SECS:-90}"
-AGENT_IMAGE="corpus-cdk-agent:0.3.7"
+AGENT_IMAGE="corpus-cdk-agent:0.3.8"
 
 reply_ok() { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
 reply_error() {
@@ -209,7 +209,7 @@ doctor_result() {
 handle_setup() {
     local id="$1" params="$2" key result cdk_source out
     load_lifecycle_context "$params" || { reply_error "$id" invalid_context "setup requires an absolute state_dir" false; return; }
-    key="$(jq -r '.idempotency_key // "setup:cdk-regtest:0.3.7"' <<<"$params")"
+    key="$(jq -r '.idempotency_key // "setup:cdk-regtest:0.3.8"' <<<"$params")"
     progress "$id" dependency_fetch "default source locks verified" 1 5
     cdk_source="$(jq -r '.sources[]? | select(.id=="cdk") | .host_path' <<<"$params" | head -1)"
     [ -d "$cdk_source/.git" ] || { operation_failure "$key" source_missing "CDK source was not materialized by Corpus" true; reply_error "$id" source_missing "CDK source was not materialized by Corpus" true; return; }
