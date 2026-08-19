@@ -1,4 +1,28 @@
-name = "cdk-regtest"
-version = "0.2.0"
-description = "CDK regtest arena (bitcoind + 4 LN nodes + 2 cdk-mintd) — first-party plugin: sandbox, oracles, faucet, targets"
+manifest_version = 1
+id = "cdk-regtest"
+version = "0.3.2"
+description = "Session-scoped CDK Cashu regtest environment"
+protocol = "corpus.environment/1"
 exec = "plugin"
+capabilities = [
+  "sessions",
+  "sandbox.exec",
+  "faucet.bolt11",
+  "wallet.fund",
+  "oracle.run",
+  "lifecycle.setup",
+]
+
+[[sources]]
+id = "cdk"
+repo = "cashubtc/cdk"
+default_rev = "v0.18.0-rc.0"
+default_sha = "4ecf992f031a37154ff9e651d029d7053608b37e"
+mount = "/opt/src/cdk"
+
+[[sources]]
+id = "nuts"
+repo = "cashubtc/nuts"
+default_rev = "main"
+default_sha = "3bc8b6d5b160d4427cbde01b4cd1c782ce6a835a"
+mount = "/opt/src/nuts"

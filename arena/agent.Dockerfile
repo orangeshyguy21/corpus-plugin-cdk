@@ -8,7 +8,7 @@
 # Hardening is applied at runtime (see arena.sh): dropped capabilities,
 # read-only root fs, no-new-privileges, resource caps. This Dockerfile only
 # guarantees a non-root default user and a sane PID 1.
-FROM debian:stable-slim
+FROM debian:stable-slim@sha256:1710bde34461551a19a47c787885ec9ad7058d9a5bead2affb8d088fa2f8502b
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

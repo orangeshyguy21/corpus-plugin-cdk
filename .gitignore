@@ -1,0 +1,7 @@
+/corpus-faucet
+/evidence/
+/tools/cdk-cli
+/faucet-src/target/
+/.artifacts/
+*.tmp
+*.partial

@@ -1,461 +1,241 @@
 #!/usr/bin/env bash
-# corpus plugin: cdk-regtest — the first-party CDK regtest arena harness.
-#
-# Protocol: newline-delimited JSON on stdin/stdout. Logs go to stderr.
-# This adapter is fully self-contained: the arena (arena.sh), oracles, and
-# faucet all live in this plugin directory. The regtest environment itself
-# (bitcoind + LN nodes + mints, via `just regtest` in the cdk repo) is
-# started by the operator; this plugin owns the arena around it.
-#
-# The plugin owns the long-lived sandbox container (corpus-sandbox-testing)
-# and the per-payment faucet cap; corpus-mcp keeps the per-session budget.
+# cdk-regtest — corpus.environment/1 adapter. stdout is protocol-only NDJSON.
 set -uo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARENA="$PLUGIN_DIR/arena.sh"
 CONF="$PLUGIN_DIR/config.toml"
 ORACLES_DIR="$PLUGIN_DIR/oracles"
-# Faucet: prefer the compiled cln-rpc client (corpus-faucet, built by setup.sh)
-# — it talks to CLN "two" directly over its socket, exactly as cdk's own itests
-# do, with no lightning-cli/nix/timeout dependency. Fall back to the shell
-# faucet where the binary is absent. Both honor the same CLI and the same
-# stdout markers (PAID_SATS=, a lnbcrt… bolt11, a bare integer), so the faucet
-# handler's parsing is identical either way.
-if [ -x "$PLUGIN_DIR/corpus-faucet" ]; then
-    FAUCET="$PLUGIN_DIR/corpus-faucet"
-else
-    FAUCET="$PLUGIN_DIR/faucet.sh"
-fi
-TOOLS_DIR="$PLUGIN_DIR/tools"
-EVIDENCE_DIR="$PLUGIN_DIR/evidence"
-MANIFEST="$PLUGIN_DIR/../../sources.toml"
-GW_NAME="corpus-target-gw"
-SANDBOX="corpus-sandbox-testing"
 EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-90}"
-# Host-side wall-clock cap for a single oracle. MUST stay comfortably under
-# the plugin's call timeout (CORPUS_PLUGIN_CALL_TIMEOUT_MS in corpus-core,
-# default 120s): a slow oracle has to abort ITSELF and return `inconclusive`,
-# never let the plugin's global timeout fire and kill the whole process tree
-# (which took down every verify call in the first cdk campaign).
 ORACLE_TIMEOUT_SECS="${CORPUS_ORACLE_TIMEOUT_SECS:-90}"
+AGENT_IMAGE="corpus-cdk-agent:0.3.2"
 
-reply_ok()   { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
-reply_err()  { printf '{"id":%s,"ok":false,"error":%s}\n' "$1" "$(jq -Rn --arg e "$2" '$e')"; }
-
-# run_with_timeout <secs> <outfile> <cmd...>
-# Run cmd with combined stdout+stderr redirected to <outfile>, killed after
-# <secs>. Returns cmd's exit code, or 124 if it was timed out. Prefers
-# timeout(1)/gtimeout(1) when present; macOS ships neither, so it falls back
-# to a pure-bash watchdog that TERMs then KILLs the process on the deadline.
-run_with_timeout() {
-    local secs="$1" outfile="$2"; shift 2
-    if command -v timeout >/dev/null 2>&1; then
-        timeout "$secs" "$@" >"$outfile" 2>&1; return $?
-    fi
-    if command -v gtimeout >/dev/null 2>&1; then
-        gtimeout "$secs" "$@" >"$outfile" 2>&1; return $?
-    fi
-    local marker="$outfile.killed"
-    rm -f "$marker"
-    "$@" >"$outfile" 2>&1 &
-    local cmd_pid=$!
-    # Watchdog: only fires (and marks) if the command is still alive at the
-    # deadline, so a natural early exit is never misreported as a timeout.
-    ( sleep "$secs"
-      if kill -0 "$cmd_pid" 2>/dev/null; then
-          : >"$marker"
-          kill -TERM "$cmd_pid" 2>/dev/null
-          sleep 2
-          kill -KILL "$cmd_pid" 2>/dev/null
-      fi ) >/dev/null 2>&1 &
-    local watch_pid=$!
-    wait "$cmd_pid" 2>/dev/null; local rc=$?
-    kill "$watch_pid" 2>/dev/null; wait "$watch_pid" 2>/dev/null
-    if [ -f "$marker" ]; then rm -f "$marker"; return 124; fi
-    return "$rc"
+reply_ok() { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
+reply_error() {
+    jq -nc --argjson id "$1" --arg code "$2" --arg message "$3" \
+        --argjson retryable "${4:-false}" \
+        '{id:$id,ok:false,error:{code:$code,message:$message,retryable:$retryable}}'
+}
+progress() {
+    jq -nc --argjson id "$1" --arg phase "$2" --arg message "$3" \
+        --argjson completed "$4" --argjson total "$5" \
+        '{id:$id,event:"progress",phase:$phase,message:$message,completed:$completed,total:$total}'
 }
 
-config_get() { # config_get <section> <key>
+config_get() {
     awk -v section="$1" -v key="$2" '
         function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
-        /^\[[^]]+\]/ {
-            cur = $0
-            gsub(/\[|\]|[ \t]/, "", cur)
-            next
-        }
+        /^\[[^]]+\]/ { cur=$0; gsub(/\[|\]|[ \t]/, "", cur); next }
         cur == section {
-            line = $0
-            sub(/[ \t]*#.*$/, "", line)
+            line=$0; sub(/[ \t]*#.*$/, "", line)
             if (index(line, "=") == 0) next
-            if (trim(substr(line, 1, index(line, "=") - 1)) == key) {
-                val = trim(substr(line, index(line, "=") + 1))
-                gsub(/^"|"$/, "", val)
-                print val
-                exit
+            if (trim(substr(line,1,index(line,"=")-1)) == key) {
+                val=trim(substr(line,index(line,"=")+1)); gsub(/^"|"$/, "", val)
+                print val; exit
             }
         }
     ' "$CONF"
 }
-
-config_url_port() { # config_url_port <mint_url> — port (default 80 if absent)
-    local url="${1#*://}"
-    url="${url%%/*}"
-    local port="${url##*:}"
-    [ "$port" = "$url" ] && port=80
+url_port() {
+    local value="${1#*://}"; value="${value%%/*}"
+    local port="${value##*:}"; [ "$port" = "$value" ] && port=80
     printf '%s' "$port"
 }
-
-manifest_get() { # manifest_get <name> <key> — sources.toml [sources.<name>]
-    awk -v name="$1" -v key="$2" '
-        function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
-        /^\[sources\.[^]]+\]/ {
-            cur = $0
-            sub(/^\[sources\./, "", cur)
-            gsub(/\]|[ \t]/, "", cur)
-            next
-        }
-        cur == name {
-            line = $0
-            sub(/[ \t]*#.*$/, "", line)
-            if (index(line, "=") == 0) next
-            if (trim(substr(line, 1, index(line, "=") - 1)) == key) {
-                val = trim(substr(line, index(line, "=") + 1))
-                gsub(/^"|"$/, "", val)
-                print val
-                exit
-            }
-        }
-    ' "$MANIFEST"
-}
-
-sanitized_name() {
-    case "$1" in *[!a-zA-Z0-9._-]* | "" | *..*) return 1 ;; esac
+safe_name() {
+    case "$1" in ""|*[!a-zA-Z0-9._+-]*|*..*) return 1 ;; esac
     printf '%s' "$1"
 }
-
-# Parse a params.sources object ("<name>": "<sha40>") into env exports for
-# the arena (one "CORPUS_SOURCE_SHA_<NAME>=<sha>" line per entry). Names and
-# shas are strictly validated — they land in env names and docker mount
-# paths, and a malformed pin must never reach either.
-parse_source_overrides() { # parse_source_overrides <params-json> -> env lines
-    local params="$1" pairs line name sha
-    pairs="$(jq -r '.sources // {} | to_entries[] | "\(.key)=\(.value)"' <<<"$params" 2>/dev/null)" || return 1
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        name="${line%%=*}"; sha="${line#*=}"
-        case "$name" in *[!a-z0-9._-]* | "") return 1 ;; esac
-        case "$sha" in *[!0-9a-f]* | "") return 1 ;; esac
-        [ "${#sha}" -eq 40 ] || return 1
-        printf 'CORPUS_SOURCE_SHA_%s=%s\n' \
-            "$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')" "$sha"
-    done <<<"$pairs"
-}
-
-# The sha the sandbox should mount for a source: the mission-pinned
-# override when present, else the config.toml default pin.
-desired_source_sha() { # desired_source_sha <name> <exports-text>
-    local name="$1" line
-    line="$(grep "^CORPUS_SOURCE_SHA_$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')=" <<<"$2" 2>/dev/null)"
-    if [ -n "$line" ]; then
-        printf '%s' "${line#*=}"
+hash12() {
+    if command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$1" | shasum -a 256 | awk '{print substr($1,1,12)}'
     else
-        config_get sources "${name}_sha"
+        printf '%s' "$1" | sha256sum | awk '{print substr($1,1,12)}'
     fi
 }
-
-# Do the live container's /opt/src mounts match the desired shas? The
-# sandbox is long-lived; a mission with different source pins must not
-# inherit the previous mission's mounts.
-sandbox_mounts_match() { # sandbox_mounts_match <exports-text>
-    local name desired live
-    for name in cdk nuts; do
-        desired="$(desired_source_sha "$name" "$1")"
-        [ -n "$desired" ] || continue
-        live="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/src/'"$name"'"}}{{.Source}}{{end}}{{end}}' "$SANDBOX" 2>/dev/null)"
-        case "$live" in
-            */"$desired") ;;  # mount source IS sources/<name>/<sha>
-            *) return 1 ;;
-        esac
-    done
-    return 0
+atomic_json() {
+    local path="$1" value="$2" tmp
+    tmp="$path.tmp.$$"
+    mkdir -p "$(dirname "$path")"
+    printf '%s\n' "$value" >"$tmp" && mv "$tmp" "$path"
+}
+operation_file() {
+    local key; key="$(printf '%s' "$1" | tr -c 'a-zA-Z0-9._+-' '_')"
+    printf '%s/operations/%s.json' "$STATE_DIR" "$key"
+}
+operation_success() {
+    atomic_json "$(operation_file "$1")" \
+        "$(jq -nc --arg key "$1" --argjson result "$2" '{idempotency_key:$key,state:"succeeded",result:$result}')"
+}
+operation_failure() {
+    atomic_json "$(operation_file "$1")" \
+        "$(jq -nc --arg key "$1" --arg code "$2" --arg message "$3" --argjson retryable "$4" \
+            '{idempotency_key:$key,state:"failed",error:{code:$code,message:$message,retryable:$retryable}}')"
 }
 
-# Is the arena sandbox up and ready to exec into?
-sandbox_ready() {
-    [ "$(docker inspect -f '{{.State.Running}}' "$SANDBOX" 2>/dev/null)" = "true" ]
+load_lifecycle_context() {
+    STATE_DIR="$(jq -r '.state_dir // ""' <<<"$1")"
+    SOURCE_CACHE="$(jq -r '.source_cache // ""' <<<"$1")"
+    SOURCES_JSON="$(jq -c '.sources // []' <<<"$1")"
+    [ -n "$STATE_DIR" ] && [ "${STATE_DIR#/}" != "$STATE_DIR" ] || return 1
+    TOOLS_DIR="$STATE_DIR/tools"
+    mkdir -p "$STATE_DIR/operations"
+}
+load_session_context() {
+    local params="$1" suffix
+    SESSION_ID="$(safe_name "$(jq -r '.session_id // ""' <<<"$params")")" || return 1
+    STATE_DIR="$(jq -r '.state_dir // ""' <<<"$params")"
+    SOURCES_JSON="$(jq -c '.sources // []' <<<"$params")"
+    [ -n "$STATE_DIR" ] && [ "${STATE_DIR#/}" != "$STATE_DIR" ] || return 1
+    suffix="$(hash12 "$SESSION_ID")"
+    RUNTIME_DIR="$(dirname "$(dirname "$STATE_DIR")")"
+    TOOLS_DIR="$RUNTIME_DIR/tools"
+    FAUCET="$RUNTIME_DIR/corpus-faucet"; [ -x "$FAUCET" ] || FAUCET="$PLUGIN_DIR/faucet.sh"
+    EVIDENCE_DIR="$STATE_DIR/evidence"
+    ARENA_NETWORK="corpus-cdk-$suffix"
+    EGRESS_NETWORK="corpus-cdk-egress-$suffix"
+    GATEWAY_NAME="corpus-cdk-gateway-$suffix"
+    SANDBOX_NAME="corpus-cdk-sandbox-$suffix"
+    mkdir -p "$STATE_DIR/operations" "$EVIDENCE_DIR"
+}
+run_arena() {
+    CORPUS_AGENT_IMAGE="$AGENT_IMAGE" CORPUS_ARENA_NETWORK="$ARENA_NETWORK" \
+    CORPUS_EGRESS_NETWORK="$EGRESS_NETWORK" CORPUS_GATEWAY_NAME="$GATEWAY_NAME" \
+    CORPUS_SANDBOX_NAME="$SANDBOX_NAME" CORPUS_EVIDENCE_DIR="$EVIDENCE_DIR" \
+    CORPUS_TOOLS_DIR="$TOOLS_DIR" CORPUS_SOURCES_JSON="$SOURCES_JSON" "$ARENA" "$@"
+}
+run_with_timeout() {
+    local secs="$1" outfile="$2"; shift 2
+    if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@" >"$outfile" 2>&1; return $?; fi
+    if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@" >"$outfile" 2>&1; return $?; fi
+    local marker="$outfile.killed" cmd_pid watch_pid rc; rm -f "$marker"
+    "$@" >"$outfile" 2>&1 & cmd_pid=$!
+    ( sleep "$secs"; if kill -0 "$cmd_pid" 2>/dev/null; then : >"$marker"; kill -TERM "$cmd_pid" 2>/dev/null; sleep 2; kill -KILL "$cmd_pid" 2>/dev/null; fi ) >/dev/null 2>&1 & watch_pid=$!
+    wait "$cmd_pid" 2>/dev/null; rc=$?; kill "$watch_pid" 2>/dev/null; wait "$watch_pid" 2>/dev/null
+    if [ -f "$marker" ]; then rm -f "$marker"; return 124; fi; return "$rc"
+}
+docker_error() {
+    if ! command -v docker >/dev/null 2>&1; then printf '%s' dependency_missing
+    elif docker info >/dev/null 2>&1; then printf '%s' ready
+    elif [ -S "$HOME/.docker/run/docker.sock" ] && [ ! -r "$HOME/.docker/run/docker.sock" ]; then printf '%s' permission_denied
+    else printf '%s' daemon_unavailable; fi
+}
+doctor_result() {
+    local state="$1" mint1 mint2 ready=true image_digest=""; local notes=()
+    if [ "$(docker_error)" != ready ]; then ready=false; notes+=("docker $(docker_error)"); fi
+    docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1 || { ready=false; notes+=("attacker image missing"); }
+    [ -x "$state/tools/cdk-cli" ] || { ready=false; notes+=("cdk-cli missing"); }
+    [ -x "$state/corpus-faucet" ] || { ready=false; notes+=("corpus-faucet missing"); }
+    mint1="$(config_get target mint_url)"; mint2="$(config_get target mint_url_2)"
+    curl -sf --max-time 3 "$mint1/v1/info" >/dev/null 2>&1 || { ready=false; notes+=("mint-1 unreachable"); }
+    curl -sf --max-time 3 "$mint2/v1/info" >/dev/null 2>&1 || { ready=false; notes+=("mint-2 unreachable"); }
+    image_digest="$(docker image inspect "$AGENT_IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
+    local joined=ready; [ "${#notes[@]}" -gt 0 ] && joined="$(IFS=', '; echo "${notes[*]}")"
+    jq -nc --argjson ready "$ready" --arg notes "$joined" --arg image_digest "$image_digest" \
+        '{ready:$ready,notes:$notes,docker:{required:true},image_digest:$image_digest}'
 }
 
-# Lazy-start the long-lived testing sandbox (plugin-owned; promise is the
-# same as the PoC's — current behavior preserved, just moved plugin-side).
-# Source pins: a running sandbox whose mounts don't match the desired shas
-# is recreated, so a new mission never reads another mission's sources.
-ensure_sandbox() { # ensure_sandbox <id> <exports-text>
-    local id="$1" exports="$2"
-    if sandbox_ready; then
-        sandbox_mounts_match "$exports" && return 0
-        docker rm -f "$SANDBOX" >/dev/null 2>&1 || true
+handle_setup() {
+    local id="$1" params="$2" key result cdk_source out
+    load_lifecycle_context "$params" || { reply_error "$id" invalid_context "setup requires an absolute state_dir" false; return; }
+    key="$(jq -r '.idempotency_key // "setup:cdk-regtest:0.3.2"' <<<"$params")"
+    progress "$id" dependency_fetch "default source locks verified" 1 4
+    cdk_source="$(jq -r '.sources[]? | select(.id=="cdk") | .host_path' <<<"$params" | head -1)"
+    [ -d "$cdk_source/.git" ] || { operation_failure "$key" source_missing "CDK source was not materialized by Corpus" true; reply_error "$id" source_missing "CDK source was not materialized by Corpus" true; return; }
+    progress "$id" image_build "building attacker image" 2 4
+    if ! out="$(CORPUS_AGENT_IMAGE="$AGENT_IMAGE" "$ARENA" build 2>&1)"; then operation_failure "$key" image_build_failed "$out" true; reply_error "$id" image_build_failed "$out" true; return; fi
+    progress "$id" tool_build "building cdk-cli and host faucet" 3 4; mkdir -p "$TOOLS_DIR"
+    if [ ! -x "$TOOLS_DIR/cdk-cli" ]; then
+        if ! out="$(CORPUS_CDK_REPO="$cdk_source" CORPUS_TOOLS_DIR="$TOOLS_DIR" "$PLUGIN_DIR/tools/build-tools.sh" 2>&1)"; then operation_failure "$key" tool_build_failed "$out" true; reply_error "$id" tool_build_failed "$out" true; return; fi
     fi
-    local out
-    if [ -n "$exports" ]; then
-        if ! out="$(env $exports "$ARENA" agent testing --detach -- sleep infinity 2>&1)"; then
-            reply_err "$id" "sandbox start failed: $out"
-            return 1
-        fi
-    elif ! out="$("$ARENA" agent testing --detach -- sleep infinity 2>&1)"; then
-        reply_err "$id" "sandbox start failed: $out"
-        return 1
+    if [ ! -x "$STATE_DIR/corpus-faucet" ]; then
+        if ! CARGO_TARGET_DIR="$STATE_DIR/faucet-target" cargo build --manifest-path "$PLUGIN_DIR/faucet-src/Cargo.toml" --release >/dev/null 2>&1; then operation_failure "$key" faucet_build_failed "could not build corpus-faucet" true; reply_error "$id" faucet_build_failed "could not build corpus-faucet" true; return; fi
+        cp "$STATE_DIR/faucet-target/release/corpus-faucet" "$STATE_DIR/corpus-faucet"; chmod 755 "$STATE_DIR/corpus-faucet"
     fi
-    # Container starts asynchronously; wait for docker to report it running.
-    for _ in $(seq 1 20); do
-        sandbox_ready && return 0
-        sleep 1
-    done
-    reply_err "$id" "sandbox did not become ready"
-    return 1
+    progress "$id" verification "checking Docker, tools, targets, and oracle prerequisites" 4 4
+    result="$(doctor_result "$STATE_DIR")"
+    if [ "$(jq -r '.ready' <<<"$result")" != true ]; then operation_failure "$key" verification_failed "$(jq -r '.notes' <<<"$result")" true; reply_error "$id" verification_failed "$(jq -r '.notes' <<<"$result")" true; return; fi
+    operation_success "$key" "$result"; reply_ok "$id" "$result"
+}
+handle_session_open() {
+    local id="$1" params="$2" key out image_digest lock result
+    load_session_context "$params" || { reply_error "$id" invalid_context "session_open requires session_id and absolute state_dir" false; return; }
+    key="$(jq -r '.idempotency_key // empty' <<<"$params")"
+    [ "$(jq 'length' <<<"$SOURCES_JSON")" -gt 0 ] || { reply_error "$id" source_missing "session has no resolved sources" false; return; }
+    if ! out="$(run_arena up 2>&1)"; then [ -n "$key" ] && operation_failure "$key" session_open_failed "$out" true; reply_error "$id" session_open_failed "$out" true; return; fi
+    image_digest="$(docker image inspect "$AGENT_IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
+    lock="sha256:$(hash12 "$(cat "$PLUGIN_DIR/environment.lock")|$SOURCES_JSON|$image_digest")"
+    result="$(jq -nc --arg environment_lock "$lock" --arg image_digest "$image_digest" '{ready:true,environment_lock:$environment_lock,image_digest:$image_digest}')"
+    atomic_json "$STATE_DIR/session.json" "$(jq -nc --arg session_id "$SESSION_ID" --arg network "$ARENA_NETWORK" --arg egress_network "$EGRESS_NETWORK" --arg gateway "$GATEWAY_NAME" --arg sandbox "$SANDBOX_NAME" --arg image_digest "$image_digest" --argjson sources "$SOURCES_JSON" '{session_id:$session_id,state:"ready",network:$network,egress_network:$egress_network,gateway:$gateway,sandbox:$sandbox,image_digest:$image_digest,sources:$sources}')"
+    [ -n "$key" ] && operation_success "$key" "$result"; reply_ok "$id" "$result"
+}
+ensure_ready_session() {
+    load_session_context "$1" || return 1
+    [ -f "$STATE_DIR/session.json" ] && [ "$(jq -r '.session_id' "$STATE_DIR/session.json")" = "$SESSION_ID" ] && [ "$(jq -r '.state' "$STATE_DIR/session.json")" = ready ]
 }
 
 handle() {
     local id="$1" method="$2" params="$3"
-
     case "$method" in
-        probe)
-            local ready=false notes net egress_net m1 m2
-            # The running mint's version + the manifest's expected tag,
-            # reported to the app as STRUCTURED fields (not just spliced into
-            # notes): the app shows what is actually running and flags a pin
-            # that disagrees. Empty until the mint answers /v1/info.
-            local running_version="" expected_tag=""
-            if ! command -v docker >/dev/null 2>&1; then
-                notes="docker not found (install OrbStack or Docker Desktop)"
-            elif ! docker info >/dev/null 2>&1; then
-                notes="docker daemon not running"
-            elif ! docker network inspect "$(config_get arena network)" >/dev/null 2>&1 \
-                || ! docker network inspect "$(config_get arena egress_network)" >/dev/null 2>&1 \
-                || ! docker image inspect corpus-agent:local >/dev/null 2>&1 \
-                || [ "$(docker inspect "$GW_NAME" --format '{{.State.Running}}' 2>/dev/null)" != "true" ]; then
-                # Liveness, not existence: a stopped gateway still passes
-                # plain `docker inspect` but the sandbox cannot reach the
-                # mints through it (the PoC-blocking provisioning gap).
-                notes="arena not up or target gateway stopped (run: arena.sh up, or call the up method)"
-            else
-                m1="$(config_get target mint_url)"; m2="$(config_get target mint_url_2)"
-                local info1 info2
-                info1="$(curl -sf --max-time 3 "$m1/v1/info" 2>/dev/null || true)"
-                info2="$(curl -sf --max-time 3 "$m2/v1/info" 2>/dev/null || true)"
-                if [ -n "$info1" ] && [ -n "$info2" ]; then
-                    ready=true
-                    notes="arena up, mints reachable"
-                    # Version-pin consistency: map the running mint's version
-                    # to a SHA via sources.toml and compare against what
-                    # config.toml [sources] pins/mounts. Wrong source mounted
-                    # for the running mint = every finding is invalid.
-                    local ver tag msha csha mtag
-                    ver="$(jq -r '.version // ""' <<<"$info1" | sed 's#^cdk-mintd/##')"
-                    if [ -n "$ver" ]; then
-                        tag="v${ver}"
-                        mtag="$(manifest_get cdk tag)"
-                        msha="$(manifest_get cdk sha)"
-                        csha="$(config_get sources cdk_sha)"
-                        # Report what is running even when it MISMATCHES: that
-                        # is exactly when the operator needs to see the version.
-                        running_version="$ver"
-                        expected_tag="$mtag"
-                        if [ -n "$mtag" ] && [ "$tag" != "$mtag" ]; then
-                            # The dangerous case: agent reads source for a
-                            # version the mint is NOT running.
-                            ready=false
-                            notes="mint runs $ver but sources.toml pins $mtag — mounted source does not match the running mint"
-                        elif [ -n "$msha" ] && [ -n "$csha" ] && [ "$msha" != "$csha" ]; then
-                            ready=false
-                            notes="[sources].cdk_sha ($csha) disagrees with sources.toml ($mtag @ $msha) — mounted source is not the manifest pin"
-                        fi
-                    fi
-                else
-                    notes="arena healthy; regtest mints not running (just regtest in the cdk repo)"
-                fi
-            fi
-            reply_ok "$id" "$(jq -nc --argjson ready "$ready" --arg notes "$notes" \
-                --arg running_version "$running_version" --arg expected_tag "$expected_tag" \
-                '{ready:$ready, notes:$notes,
-                  running_version:(if $running_version=="" then null else $running_version end),
-                  expected_tag:(if $expected_tag=="" then null else $expected_tag end)}')"
-            ;;
-        up)
-            out="$("$ARENA" up 2>&1)" && reply_ok "$id" "$(jq -nc '{notes:"arena up"}')" \
-                || reply_err "$id" "$out"
-            ;;
-        down)
-            out="$("$ARENA" down 2>&1)" && reply_ok "$id" "$(jq -nc '{notes:"arena down"}')" \
-                || reply_err "$id" "$out"
-            ;;
-        targets)
-            # The agent attacks over the target gateway — the ONLY off-bridge
-            # path from the internal network. Host URLs live in config.toml;
-            # what the sandbox can actually reach is gateway-scoped.
-            local m1 m2
-            m1="$(config_get target mint_url)"
-            m2="$(config_get target mint_url_2)"
-            if [ -z "$m1" ] || [ -z "$m2" ]; then
-                reply_err "$id" "targets misconfigured in $CONF"
-                return
-            fi
-            reply_ok "$id" "$(jq -nc \
-                --arg a "http://$GW_NAME:$(config_url_port "$m1")" \
-                --arg b "http://$GW_NAME:$(config_url_port "$m2")" \
-                '[ $a, $b ]')"
-            ;;
-        tools)
-            # Files mounted read-only into the sandbox (v tools/:/opt/tools:ro).
-            local items="[]"
-            for f in "$TOOLS_DIR"/*; do
-                [ -f "$f" ] || continue
-                case "$(basename "$f")" in .gitkeep|build-tools.sh) continue ;; esac
-                items="$(jq -nc --argjson items "$items" \
-                    --arg t "/opt/tools/$(basename "$f")" '$items + [$t]')"
-            done
-            reply_ok "$id" "$items"
-            ;;
-        sources)
-            # Mounted research corpus: pinned upstream trees at /opt/src/<name>.
-            # The sha is the mission-pin override when the call carries one,
-            # else config.toml [sources]; repo/tag come from the sources.toml
-            # manifest (the default pin's identity).
-            local items="[]" entry sha repo tag exports
-            exports="$(parse_source_overrides "$params")" || { reply_err "$id" "invalid sources pins (want <name>: <40-hex sha>)"; return; }
-            for entry in cdk nuts; do
-                sha="$(desired_source_sha "$entry" "$exports")"
-                [ -n "$sha" ] || continue
-                repo="$(manifest_get "$entry" repo)"
-                tag="$(manifest_get "$entry" tag)"
-                items="$(jq -nc --argjson items "$items" \
-                    --arg name "$entry" --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" \
-                    '$items + [{name:$name, repo:$repo, tag:$tag, sha:$sha, mount:("/opt/src/"+$name)}]')"
-            done
-            reply_ok "$id" "$items"
-            ;;
+        hello) reply_ok "$id" '{"protocol":"corpus.environment/1","capabilities":["sessions","sandbox.exec","faucet.bolt11","wallet.fund","oracle.run","lifecycle.setup"]}' ;;
+        operation_status)
+            load_lifecycle_context "$params" || { reply_error "$id" invalid_context "operation_status requires state_dir" false; return; }
+            local op_key op_file; op_key="$(jq -r '.idempotency_key // ""' <<<"$params")"; op_file="$(operation_file "$op_key")"
+            if [ -f "$op_file" ]; then reply_ok "$id" "$(cat "$op_file")"; else reply_ok "$id" "$(jq -nc --arg key "$op_key" '{idempotency_key:$key,state:"unknown"}')"; fi ;;
+        setup) handle_setup "$id" "$params" ;;
+        doctor|status)
+            load_lifecycle_context "$params" || { reply_error "$id" invalid_context "$method requires state_dir" false; return; }
+            local health; health="$(doctor_result "$STATE_DIR")"
+            if [ "$(jq -r '.ready' <<<"$health")" = true ]; then reply_ok "$id" "$health"; else reply_error "$id" unhealthy "$(jq -r '.notes' <<<"$health")" true; fi ;;
+        stop)
+            load_lifecycle_context "$params" || { reply_error "$id" invalid_context "stop requires state_dir" false; return; }
+            local active=0 record gateway sandbox
+            for record in "$STATE_DIR"/state/*/session.json; do [ -f "$record" ] || continue; [ "$(jq -r '.state' "$record")" = ready ] || continue; gateway="$(jq -r '.gateway' "$record")"; sandbox="$(jq -r '.sandbox' "$record")"; if docker inspect "$gateway" >/dev/null 2>&1 || docker inspect "$sandbox" >/dev/null 2>&1; then active=$((active+1)); fi; done
+            if [ "$active" -gt 0 ]; then reply_error "$id" sessions_active "$active environment session(s) are still active" true; else reply_ok "$id" '{"stopped":true}'; fi ;;
+        session_open) handle_session_open "$id" "$params" ;;
+        session_probe)
+            ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
+            local ready=true notes="session ready" version=""; docker inspect "$GATEWAY_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -qx true || { ready=false; notes="session gateway is not running"; }
+            version="$(curl -sf --max-time 3 "$(config_get target mint_url)/v1/info" 2>/dev/null | jq -r '.version // ""' | sed 's#^cdk-mintd/##')"
+            reply_ok "$id" "$(jq -nc --argjson ready "$ready" --arg notes "$notes" --arg running_version "$version" '{ready:$ready,notes:$notes,running_version:(if $running_version=="" then null else $running_version end)}')" ;;
+        describe)
+            ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
+            local m1 m2 version image_digest targets cdk_sha
+            m1="http://$GATEWAY_NAME:$(url_port "$(config_get target mint_url)")"; m2="http://$GATEWAY_NAME:$(url_port "$(config_get target mint_url_2)")"
+            version="$(curl -sf --max-time 3 "$(config_get target mint_url)/v1/info" 2>/dev/null | jq -r '.version // ""')"; image_digest="$(jq -r '.image_digest' "$STATE_DIR/session.json")"; cdk_sha="$(jq -r '.[] | select(.id=="cdk") | .sha' <<<"$SOURCES_JSON")"
+            targets="$(jq -nc --arg a "$m1" --arg b "$m2" --arg sha "$cdk_sha" --arg version "$version" --arg image "$image_digest" '[{id:"mint-1",kind:"cashu-mint",url:$a,source_id:"cdk",source_sha:$sha,reported_version:$version,image_digest:$image},{id:"mint-2",kind:"cashu-mint",url:$b,source_id:"cdk",source_sha:$sha,reported_version:$version,image_digest:$image}]')"
+            reply_ok "$id" "$(jq -nc --argjson targets "$targets" --arg image "$image_digest" '{targets:$targets,tools:[{id:"cdk-cli",description:"session-scoped Cashu attacker wallet",path:"/opt/tools/cdk-cli"}],limits:{max_payment_sats:100000},provenance:{image_digest:$image}}')" ;;
         sandbox_exec)
-            local command exports
-            command="$(jq -r '.command // ""' <<<"$params")"
-            if [ -z "$command" ]; then
-                reply_err "$id" "missing command"; return
-            fi
-            exports="$(parse_source_overrides "$params")" || { reply_err "$id" "invalid sources pins (want <name>: <40-hex sha>)"; return; }
-            if ! docker info >/dev/null 2>&1; then
-                reply_err "$id" "docker daemon not running"; return
-            fi
-            ensure_sandbox "$id" "$exports" || return
-            local output rc
-            output="$(docker exec "$SANDBOX" timeout "$EXEC_TIMEOUT_SECS" \
-                bash -c "$command" 2>&1)"; rc=$?
-            # Combined stdout+stderr; corpus-mcp applies the output size cap.
-            reply_ok "$id" "$(jq -nc \
-                --arg output "$output" --argjson exit_code "$rc" \
-                '{output:$output, exit_code:$exit_code}')"
-            ;;
+            ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
+            local command out rc; command="$(jq -r '.command // ""' <<<"$params")"; [ -n "$command" ] || { reply_error "$id" invalid_args "missing command" false; return; }
+            if [ "$(docker inspect -f '{{.State.Running}}' "$SANDBOX_NAME" 2>/dev/null)" != true ]; then if ! out="$(run_arena agent testing --detach -- sleep infinity 2>&1)"; then reply_error "$id" sandbox_start_failed "$out" true; return; fi; fi
+            out="$(docker exec "$SANDBOX_NAME" timeout "$EXEC_TIMEOUT_SECS" bash -c "$command" 2>&1)"; rc=$?; reply_ok "$id" "$(jq -nc --arg output "$out" --argjson exit_code "$rc" '{output:$output,exit_code:$exit_code}')" ;;
         oracles)
-            local items="[]"
-            for f in "$ORACLES_DIR"/[0-9]*.sh; do
-                [ -f "$f" ] || continue
-                local name desc
-                name="$(basename "$f" .sh)"
-                desc="$(grep -m1 '^# Oracle' "$f" | sed 's/^# //')"
-                items="$(jq -nc --argjson items "$items" --arg name "$name" --arg desc "$desc" \
-                    '$items + [{name:$name, description:$desc}]')"
-            done
-            reply_ok "$id" "$items"
-            ;;
+            ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
+            local items='[]' file name desc; for file in "$ORACLES_DIR"/[0-9]*.sh; do [ -f "$file" ] || continue; name="$(basename "$file" .sh)"; desc="$(grep -m1 '^# Oracle' "$file" | sed 's/^# //')"; items="$(jq -nc --argjson items "$items" --arg name "$name" --arg description "$desc" '$items+[{name:$name,description:$description}]')"; done; reply_ok "$id" "$items" ;;
         call_oracle)
-            local name
-            name="$(jq -r '.name // ""' <<<"$params")"
-            name="$(sanitized_name "$name")" || { reply_err "$id" "bad oracle name"; return; }
-            local script="$ORACLES_DIR/$name.sh"
-            [ -f "$script" ] || { reply_err "$id" "unknown oracle: $name"; return; }
-            local out rc verdict outfile
-            outfile="$(mktemp "${TMPDIR:-/tmp}/corpus-oracle.XXXXXX")"
-            # Export rather than prefix: env-prefix semantics on a shell
-            # function are ambiguous across bash versions. Overwritten each
-            # call, so leaking them into the plugin env is harmless.
-            export MINT_URL="$(config_get target mint_url)"
-            export MINT_URL_2="$(config_get target mint_url_2)"
-            export EVIDENCE_DIR
-            run_with_timeout "$ORACLE_TIMEOUT_SECS" "$outfile" bash "$script"
-            rc=$?
-            out="$(cat "$outfile" 2>/dev/null)"; rm -f "$outfile"
-            case "$rc" in
-                0)   verdict="hold" ;;
-                1)   verdict="violated" ;;
-                124) verdict="inconclusive"
-                     out="oracle timed out after ${ORACLE_TIMEOUT_SECS}s — killed before the plugin call timeout so the plugin stays alive. Partial output follows:
-$out" ;;
-                *)   verdict="inconclusive" ;;
-            esac
-            reply_ok "$id" "$(jq -nc --arg verdict "$verdict" --arg log "$out" \
-                '{verdict:$verdict, log:$log}')"
-            ;;
+            ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
+            local name script outfile out rc verdict; name="$(safe_name "$(jq -r '.name // ""' <<<"$params")")" || { reply_error "$id" invalid_args "bad oracle name" false; return; }; script="$ORACLES_DIR/$name.sh"; [ -f "$script" ] || { reply_error "$id" unknown_oracle "unknown oracle: $name" false; return; }
+            outfile="$(mktemp "${TMPDIR:-/tmp}/corpus-cdk-oracle.XXXXXX")"; MINT_URL="$(config_get target mint_url)" MINT_URL_2="$(config_get target mint_url_2)" EVIDENCE_DIR="$EVIDENCE_DIR" run_with_timeout "$ORACLE_TIMEOUT_SECS" "$outfile" bash "$script"; rc=$?; out="$(cat "$outfile" 2>/dev/null)"; rm -f "$outfile"; case "$rc" in 0) verdict=hold ;; 1) verdict=violated ;; *) verdict=inconclusive ;; esac; [ "$rc" -ne 124 ] || out="oracle timed out after ${ORACLE_TIMEOUT_SECS}s; $out"; reply_ok "$id" "$(jq -nc --arg verdict "$verdict" --arg log "$out" '{verdict:$verdict,log:$log}')" ;;
         faucet)
-            # {op, invoice?, amount_sat?, memo?} -> {text, paid_sats?}.
-            # The plugin enforces the per-payment cap (config) and the
-            # regtest-only check (faucet.sh); corpus-mcp owns the session
-            # budget. Refusals come back as text, not protocol errors, so
-            # the agent reads the actual reason.
-            [ -x "$FAUCET" ] || { reply_err "$id" "faucet not available"; return; }
-            local op invoice amount memo
-            op="$(jq -r '.op // ""' <<<"$params")"
-            invoice="$(jq -r '.invoice // ""' <<<"$params")"
-            amount="$(jq -r '.amount_sat // ""' <<<"$params")"
-            memo="$(jq -r '.memo // ""' <<<"$params")"
-            local max_sats
-            max_sats="$(config_get faucet max_payment_sats)"
-            [ -n "$max_sats" ] || max_sats=100000
-            local out err rc paid=""
-            tmp_stdout="$(mktemp)"; tmp_stderr="$(mktemp)"
-            case "$op" in
-                pay)
-                    [ -n "$invoice" ] || { rm -f "$tmp_stdout" "$tmp_stderr"; reply_err "$id" "missing invoice for op=pay"; return; }
-                    CORPUS_FAUCET_MAX_SATS="$max_sats" "$FAUCET" pay "$invoice" >"$tmp_stdout" 2>"$tmp_stderr" && rc=0 || rc=$?
-                    out="$(cat "$tmp_stdout")"; err="$(cat "$tmp_stderr")"
-                    paid="$(grep -o 'PAID_SATS=[0-9]*' <<<"$out" | cut -d= -f2 | head -1)"
-                    ;;
-                invoice)
-                    case "$amount" in *[!0-9]* | "") rm -f "$tmp_stdout" "$tmp_stderr"; reply_err "$id" "missing numeric amount_sat for op=invoice"; return ;; esac
-                    if [ -n "$memo" ]; then
-                        CORPUS_FAUCET_MAX_SATS="$max_sats" "$FAUCET" invoice "$amount" "$memo" >"$tmp_stdout" 2>"$tmp_stderr" && rc=0 || rc=$?
-                    else
-                        CORPUS_FAUCET_MAX_SATS="$max_sats" "$FAUCET" invoice "$amount" >"$tmp_stdout" 2>"$tmp_stderr" && rc=0 || rc=$?
-                    fi
-                    out="$(cat "$tmp_stdout")"; err="$(cat "$tmp_stderr")"
-                    ;;
-                balance)
-                    "$FAUCET" balance >"$tmp_stdout" 2>"$tmp_stderr" && rc=0 || rc=$?
-                    out="$(cat "$tmp_stdout")"; err="$(cat "$tmp_stderr")"
-                    ;;
-                *)
-                    rm -f "$tmp_stdout" "$tmp_stderr"
-                    reply_err "$id" "unknown faucet op: $op"; return
-                    ;;
-            esac
-            rm -f "$tmp_stdout" "$tmp_stderr"
-            if [ "$rc" -ne 0 ]; then
-                local reason
-                reason="$(grep '^faucet: error' <<<"$err" | head -1 | sed 's/^faucet: error: //')"
-                [ -n "$reason" ] || reason="faucet op '$op' failed"
-                reply_ok "$id" "$(jq -nc --arg text "[faucet error] $reason" '{text:$text, paid_sats:null}')"
-            elif [ -n "$paid" ]; then
-                reply_ok "$id" "$(jq -nc --arg text "paid $paid sat" --argjson paid_sats "$paid" \
-                    '{text:$text, paid_sats:$paid_sats}')"
-            else
-                reply_ok "$id" "$(jq -nc --arg text "$out" '{text:$text, paid_sats:null}')"
-            fi
-            ;;
-        *)
-            reply_err "$id" "unknown method: $method"
-            ;;
+            ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
+            local op invoice amount memo max out err rc paid tmp_stdout tmp_stderr; op="$(jq -r '.op // ""' <<<"$params")"; invoice="$(jq -r '.call.invoice // ""' <<<"$params")"; amount="$(jq -r '.call.amount_sat // ""' <<<"$params")"; memo="$(jq -r '.call.memo // ""' <<<"$params")"; max="$(config_get faucet max_payment_sats)"; tmp_stdout="$(mktemp)"; tmp_stderr="$(mktemp)"; paid=""
+            case "$op" in pay) CORPUS_FAUCET_MAX_SATS="$max" "$FAUCET" pay "$invoice" >"$tmp_stdout" 2>"$tmp_stderr"; rc=$? ;; invoice) CORPUS_FAUCET_MAX_SATS="$max" "$FAUCET" invoice "$amount" "$memo" >"$tmp_stdout" 2>"$tmp_stderr"; rc=$? ;; balance) "$FAUCET" balance >"$tmp_stdout" 2>"$tmp_stderr"; rc=$? ;; *) rm -f "$tmp_stdout" "$tmp_stderr"; reply_error "$id" invalid_args "unknown faucet op: $op" false; return ;; esac
+            out="$(cat "$tmp_stdout")"; err="$(cat "$tmp_stderr")"; rm -f "$tmp_stdout" "$tmp_stderr"; [ "$rc" -eq 0 ] || { reply_error "$id" faucet_failed "${err:-faucet operation failed}" true; return; }; paid="$(grep -o 'PAID_SATS=[0-9]*' <<<"$out" | cut -d= -f2 | head -1)"; reply_ok "$id" "$(jq -nc --arg text "$out" --arg paid "$paid" '{text:$text,paid_sats:(if $paid=="" then null else ($paid|tonumber) end)}')" ;;
+        wallet_fund)
+            ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
+            local amount target_id target work_dir cli quote invoice quote_id pay claim balance; amount="$(jq -r '.amount_sat // ""' <<<"$params")"; target_id="$(jq -r '.target_id // "mint-1"' <<<"$params")"; case "$amount" in ""|*[!0-9]*) reply_error "$id" invalid_args "amount_sat must be numeric" false; return ;; esac; case "$target_id" in mint-1) target="http://$GATEWAY_NAME:$(url_port "$(config_get target mint_url)")" ;; mint-2) target="http://$GATEWAY_NAME:$(url_port "$(config_get target mint_url_2)")" ;; *) reply_error "$id" invalid_args "unknown target_id: $target_id" false; return ;; esac
+            work_dir="/tmp/wallet-$(hash12 "$SESSION_ID-$target_id")"; cli="/opt/tools/cdk-cli -n -w $work_dir"; if [ "$(docker inspect -f '{{.State.Running}}' "$SANDBOX_NAME" 2>/dev/null)" != true ]; then run_arena agent testing --detach -- sleep infinity >/dev/null 2>&1 || { reply_error "$id" sandbox_start_failed "could not start attacker sandbox" true; return; }; fi
+            quote="$(docker exec "$SANDBOX_NAME" timeout "$EXEC_TIMEOUT_SECS" bash -c "rm -rf '$work_dir' && $cli mint '$target' '$amount' --wait-duration 2" 2>&1 || true)"; invoice="$(grep -o 'lnbcrt[^[:space:]]*' <<<"$quote" | head -1)"; quote_id="$(grep -o 'id=[^,[:space:]]*' <<<"$quote" | head -1 | cut -d= -f2)"; [ -n "$invoice" ] && [ -n "$quote_id" ] || { reply_error "$id" quote_failed "mint quote output missing invoice or id: $quote" true; return; }; pay="$(CORPUS_FAUCET_MAX_SATS="$(config_get faucet max_payment_sats)" "$FAUCET" pay "$invoice" 2>&1)" || { reply_error "$id" faucet_failed "$pay" true; return; }; claim="$(docker exec "$SANDBOX_NAME" timeout "$EXEC_TIMEOUT_SECS" bash -c "$cli mint '$target' -q '$quote_id' --wait-duration 15" 2>&1)" || { reply_error "$id" claim_failed "$claim" true; return; }; balance="$(docker exec "$SANDBOX_NAME" timeout "$EXEC_TIMEOUT_SECS" bash -c "$cli balance" 2>&1)" || { reply_error "$id" balance_failed "$balance" true; return; }; reply_ok "$id" "$(jq -nc --argjson amount_sat "$amount" --arg target "$target" --arg claim "$claim" --arg balance "$balance" '{funded:true,amount_sat:$amount_sat,target:$target,claim:$claim,balance:$balance}')" ;;
+        session_close)
+            load_session_context "$params" || { reply_error "$id" invalid_context "session_close requires session context" false; return; }
+            local key out result; key="$(jq -r '.idempotency_key // empty' <<<"$params")"; if ! out="$(run_arena down 2>&1)"; then [ -n "$key" ] && operation_failure "$key" cleanup_failed "$out" true; reply_error "$id" cleanup_failed "$out" true; return; fi; if [ -f "$STATE_DIR/session.json" ]; then atomic_json "$STATE_DIR/session.json" "$(jq '.state="closed"' "$STATE_DIR/session.json")"; fi; result='{"closed":true}'; [ -n "$key" ] && operation_success "$key" "$result"; reply_ok "$id" "$result" ;;
+        *) reply_error "$id" unknown_method "unknown method: $method" false ;;
     esac
 }
 
 while IFS= read -r line; do
     id="$(jq -r '.id // 0' <<<"$line" 2>/dev/null)" || id=0
     method="$(jq -r '.method // ""' <<<"$line" 2>/dev/null)" || method=""
-    params="$(jq -c '.params // {}' <<<"$line" 2>/dev/null)" || params="{}"
+    params="$(jq -c '.params // {}' <<<"$line" 2>/dev/null)" || params='{}'
     handle "$id" "$method" "$params"
 done

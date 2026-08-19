@@ -10,12 +10,12 @@ set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${CORPUS_CONFIG:-$PLUGIN_DIR/config.toml}"
-AGENT_IMAGE="corpus-agent:local"
-GW_NAME="corpus-target-gw"
-EVIDENCE_DIR="$PLUGIN_DIR/evidence"
-TOOLS_DIR="$PLUGIN_DIR/tools"
-SOURCES_DIR="$(cd "$PLUGIN_DIR/../.." && pwd)/sources"
-SOURCES_MANIFEST="${CORPUS_SOURCES_MANIFEST:-$(cd "$PLUGIN_DIR/../.." && pwd)/sources.toml}"
+AGENT_IMAGE="${CORPUS_AGENT_IMAGE:-corpus-cdk-agent:0.3.0}"
+GW_NAME="${CORPUS_GATEWAY_NAME:-corpus-cdk-gateway-dev}"
+SANDBOX_NAME="${CORPUS_SANDBOX_NAME:-corpus-cdk-sandbox-dev}"
+EVIDENCE_DIR="${CORPUS_EVIDENCE_DIR:-${TMPDIR:-/tmp}/corpus-cdk-dev/evidence}"
+TOOLS_DIR="${CORPUS_TOOLS_DIR:-$PLUGIN_DIR/tools}"
+SOURCES_JSON="${CORPUS_SOURCES_JSON:-[]}"
 
 usage() {
     cat <<'EOF'
@@ -23,6 +23,7 @@ corpus cdk-regtest arena
 
   arena.sh doctor        Check prerequisites and probe sandbox isolation
   arena.sh up            Create arena networks, gateway, and agent image
+  arena.sh build         Build the shared attacker image only
   arena.sh down          Remove agent containers and arena networks
   arena.sh agent <job> [--egress|--no-egress] [--detach] [-- cmd...]
                         Start a locked-down agent container for a job
@@ -101,8 +102,8 @@ url_retarget() {
 # arena: inference is orchestrated host-side.
 start_gateway() {
     local net egress_net ports
-    net="$(cfg arena network corpus-arena)"
-    egress_net="$(cfg arena egress_network corpus-arena-egress)"
+    net="${CORPUS_ARENA_NETWORK:-$(cfg arena network corpus-arena)}"
+    egress_net="${CORPUS_EGRESS_NETWORK:-$(cfg arena egress_network corpus-arena-egress)}"
     ports="$(url_port "$(cfg target mint_url http://127.0.0.1:8085)")"
     ports="$ports $(url_port "$(cfg target mint_url_2 http://127.0.0.1:8087)")"
     # shellcheck disable=SC2086
@@ -131,8 +132,8 @@ start_gateway() {
 cmd_up() {
     need_docker
     local net egress_net
-    net="$(cfg arena network corpus-arena)"
-    egress_net="$(cfg arena egress_network corpus-arena-egress)"
+    net="${CORPUS_ARENA_NETWORK:-$(cfg arena network corpus-arena)}"
+    egress_net="${CORPUS_EGRESS_NETWORK:-$(cfg arena egress_network corpus-arena-egress)}"
 
     mkdir -p "$EVIDENCE_DIR" "$TOOLS_DIR"
 
@@ -152,10 +153,8 @@ cmd_up() {
         echo "network $egress_net: created (egress allowed)"
     fi
 
-    echo "building $AGENT_IMAGE (cached if unchanged)..."
-    docker build -t "$AGENT_IMAGE" \
-        -f "$PLUGIN_DIR/arena/agent.Dockerfile" \
-        "$PLUGIN_DIR/arena"
+    docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1 \
+        || die "image $AGENT_IMAGE missing; run Corpus plugin setup"
 
     start_gateway
 
@@ -163,13 +162,21 @@ cmd_up() {
     echo "arena up. Next: arena.sh doctor"
 }
 
+cmd_build() {
+    need_docker
+    echo "building $AGENT_IMAGE (cached if unchanged)..."
+    docker build -t "$AGENT_IMAGE" \
+        -f "$PLUGIN_DIR/arena/agent.Dockerfile" \
+        "$PLUGIN_DIR/arena"
+}
+
 cmd_down() {
     need_docker
     local net egress_net
-    net="$(cfg arena network corpus-arena)"
-    egress_net="$(cfg arena egress_network corpus-arena-egress)"
+    net="${CORPUS_ARENA_NETWORK:-$(cfg arena network corpus-arena)}"
+    egress_net="${CORPUS_EGRESS_NETWORK:-$(cfg arena egress_network corpus-arena-egress)}"
 
-    docker ps -aq --filter "name=^/corpus-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+    docker rm -f "$SANDBOX_NAME" "$GW_NAME" >/dev/null 2>&1 || true
     docker network rm "$net" >/dev/null 2>&1 && echo "removed $net" || true
     docker network rm "$egress_net" >/dev/null 2>&1 && echo "removed $egress_net" || true
     echo "arena down (image $AGENT_IMAGE kept; docker image rm to remove)"
@@ -201,9 +208,9 @@ cmd_agent() {
 
     local net
     if [ "$egress" = "true" ]; then
-        net="$(cfg arena egress_network corpus-arena-egress)"
+        net="${CORPUS_EGRESS_NETWORK:-$(cfg arena egress_network corpus-arena-egress)}"
     else
-        net="$(cfg arena network corpus-arena)"
+        net="${CORPUS_ARENA_NETWORK:-$(cfg arena network corpus-arena)}"
     fi
     docker network inspect "$net" >/dev/null 2>&1 || die "network $net missing; run: arena.sh up"
     docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1 || die "image missing; run: arena.sh up"
@@ -216,11 +223,11 @@ cmd_agent() {
     mint_url="$(url_retarget "$(cfg target mint_url http://127.0.0.1:8085)" "$GW_NAME")"
     mint_url_2="$(url_retarget "$(cfg target mint_url_2 http://127.0.0.1:8087)" "$GW_NAME")"
 
-    docker rm -f "corpus-sandbox-$job" >/dev/null 2>&1 || true
+    docker rm -f "$SANDBOX_NAME" >/dev/null 2>&1 || true
 
     local run_args=(
         --rm
-        --name "corpus-sandbox-$job"
+        --name "$SANDBOX_NAME"
         --network "$net"
         --user attacker
         --read-only
@@ -259,7 +266,7 @@ cmd_agent() {
     echo "job=$job egress=$egress net=$net mem=$mem cpus=$cpus pids=$pids" >&2
     docker run "${run_args[@]}" "$AGENT_IMAGE" "$@"
     if [ "$detach" = true ]; then
-        echo "detached agent container: corpus-sandbox-$job" >&2
+        echo "detached agent container: $SANDBOX_NAME" >&2
     fi
 }
 
@@ -270,17 +277,18 @@ cmd_agent() {
 # pins: an agent must never silently run without the source the mission pins
 # assume.
 source_mount_args() {
-    local args=() name sha tree
-    for name in cdk nuts; do
-        local var="CORPUS_SOURCE_SHA_$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
-        sha="${!var:-$(cfg sources "${name}_sha" '')}"
-        [ -n "$sha" ] || continue
-        tree="$SOURCES_DIR/$name/$sha"
-        if [ ! -d "$tree/.git" ]; then
-            die "sources/$name/$sha not fetched — re-launch the mission (pins fetch at launch) or run: bash plugins/cdk-regtest/setup.sh"
-        fi
-        args+=(-v "$tree:/opt/src/$name:ro")
-    done
+    local args=() row name sha tree mount
+    while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        name="$(jq -r '.id' <<<"$row")"
+        sha="$(jq -r '.sha' <<<"$row")"
+        tree="$(jq -r '.host_path' <<<"$row")"
+        mount="$(jq -r '.mount' <<<"$row")"
+        [ -d "$tree/.git" ] || die "source $name@$sha is absent at explicit host path $tree"
+        [ "$(git -C "$tree" rev-parse HEAD 2>/dev/null || true)" = "$sha" ] \
+            || die "source $name at $tree does not match declared sha $sha"
+        args+=(-v "$tree:$mount:ro")
+    done < <(jq -c '.[]' <<<"$SOURCES_JSON")
     printf '%s\n' "${args[@]}"
 }
 
@@ -336,33 +344,27 @@ cmd_doctor() {
         check warn "mint 2 unreachable: $mint_url_2"
     fi
 
-    echo "sources (pinned research corpus)"
-    local name sha tree
-    for name in cdk nuts; do
-        local var="CORPUS_SOURCE_SHA_$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
-        sha="${!var:-$(cfg sources "${name}_sha" '')}"
-        if [ -z "$sha" ]; then
-            check warn "sources/$name: not configured in config.toml [sources]"
-            continue
-        fi
-        tree="$SOURCES_DIR/$name/$sha"
-        if [ ! -d "$tree/.git" ]; then
-            check warn "sources/$name/$sha not fetched (run: plugins/cdk-regtest/setup.sh)"
-            continue
-        fi
-        local head
-        head="$(git -C "$tree" rev-parse HEAD 2>/dev/null || true)"
-        if [ "$head" = "$sha" ]; then
-            check ok "sources/$name: HEAD == pin ($sha)${!var:+ (mission override)}"
-        else
-            check fail "sources/$name: HEAD $head != pinned $sha — re-fetch"
-        fi
-    done
+    echo "sources (explicit session records)"
+    if [ "$(jq 'length' <<<"$SOURCES_JSON")" -eq 0 ]; then
+        check warn "no session sources supplied"
+    else
+        local row name sha tree
+        while IFS= read -r row; do
+            name="$(jq -r '.id' <<<"$row")"
+            sha="$(jq -r '.sha' <<<"$row")"
+            tree="$(jq -r '.host_path' <<<"$row")"
+            if [ -d "$tree/.git" ] && [ "$(git -C "$tree" rev-parse HEAD 2>/dev/null || true)" = "$sha" ]; then
+                check ok "$name: $sha at $tree"
+            else
+                check fail "$name: explicit source path or sha mismatch ($tree)"
+            fi
+        done < <(jq -c '.[]' <<<"$SOURCES_JSON")
+    fi
 
     echo "arena"
     local net egress_net
-    net="$(cfg arena network corpus-arena)"
-    egress_net="$(cfg arena egress_network corpus-arena-egress)"
+    net="${CORPUS_ARENA_NETWORK:-$(cfg arena network corpus-arena)}"
+    egress_net="${CORPUS_EGRESS_NETWORK:-$(cfg arena egress_network corpus-arena-egress)}"
     local nets_up=true image_up=true
     docker network inspect "$net" >/dev/null 2>&1 && check ok "network $net" || { check warn "network $net missing (run: arena.sh up)"; nets_up=false; }
     docker network inspect "$egress_net" >/dev/null 2>&1 && check ok "network $egress_net" || { check warn "network $egress_net missing"; nets_up=false; }
@@ -409,19 +411,9 @@ cmd_status() {
     echo "networks:"
     docker network ls --filter "name=corpus-arena" --format '  {{.Name}} ({{.Driver}} internal={{.Internal}})'
     echo "containers:"
-    docker ps -a --filter "name=corpus-" --format '  {{.Names}} {{.Status}}'
+    docker ps -a --filter "name=$GW_NAME" --filter "name=$SANDBOX_NAME" --format '  {{.Names}} {{.Status}}'
     echo "evidence: $EVIDENCE_DIR ($(du -sh "$EVIDENCE_DIR" 2>/dev/null | cut -f1 || echo empty))"
-    echo "sources: $SOURCES_DIR"
-    local name sha head
-    for name in cdk nuts; do
-        sha="$(cfg sources "${name}_sha" '')"
-        if [ -n "$sha" ] && [ -d "$SOURCES_DIR/$name/$sha/.git" ]; then
-            head="$(git -C "$SOURCES_DIR/$name/$sha" rev-parse HEAD 2>/dev/null || echo ?)"
-            echo "  $name: mounted $sha (HEAD $head)"
-        else
-            echo "  $name: not fetched"
-        fi
-    done
+    echo "sources: $(jq -c '.' <<<"$SOURCES_JSON")"
 }
 
 main() {
@@ -429,6 +421,7 @@ main() {
     shift || true
     case "$cmd" in
         up) cmd_up "$@" ;;
+        build) cmd_build "$@" ;;
         down) cmd_down "$@" ;;
         agent) cmd_agent "$@" ;;
         doctor) cmd_doctor "$@" ;;

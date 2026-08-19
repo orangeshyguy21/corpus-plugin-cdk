@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: orangeshyguy21/corpus
+          path: corpus
+      - run: scripts/conformance.sh "$GITHUB_WORKSPACE/corpus"
+
+  docker-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n plugin arena.sh faucet.sh tools/build-tools.sh
