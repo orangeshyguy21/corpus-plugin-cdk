@@ -27,9 +27,9 @@ this plugin.
 
 Docker Desktop or OrbStack, Nix, `jq`, `curl`, and Bash are required. Setup
 builds the shared attacker image and CDK client into Corpus-owned runtime
-state. The attacker gets Python with Requests for fast protocol scripting, a
-prebuilt CDK client, and a disposable writable `/work`; source and tool mounts
-remain read-only. When the configured
+state. The attacker gets Python with Requests and Coincurve for fast protocol
+scripting and secp256k1/BIP340 Schnorr PoCs, a prebuilt CDK client, and a
+disposable writable `/work`; source and tool mounts remain read-only. When the configured
 mint ports are unused it launches CDK's pinned,
 non-interactive `start-regtest-mints` flake app and records the process and
 working tree beneath plugin state. If compatible mints are already listening,

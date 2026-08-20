@@ -18,12 +18,16 @@ RUN apt-get update \
         jq \
         python3 \
         python3-requests \
+        python3-venv \
         sqlite3 \
         socat \
         tini \
+    && python3 -m venv --system-site-packages /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir coincurve==21.0.0 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /bin/bash attacker
 
+ENV PATH="/opt/venv/bin:${PATH}"
 USER attacker
 WORKDIR /work
 

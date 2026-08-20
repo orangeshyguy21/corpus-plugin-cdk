@@ -8,7 +8,7 @@ CONF="$PLUGIN_DIR/config.toml"
 ORACLES_DIR="$PLUGIN_DIR/oracles"
 EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-90}"
 ORACLE_TIMEOUT_SECS="${CORPUS_ORACLE_TIMEOUT_SECS:-90}"
-AGENT_IMAGE="corpus-cdk-agent:0.4.4"
+AGENT_IMAGE="corpus-cdk-agent:0.4.5"
 
 reply_ok() { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
 reply_error() {
@@ -299,7 +299,7 @@ handle() {
             m1="http://$GATEWAY_NAME:$(url_port "$(config_get target mint_url)")"; m2="http://$GATEWAY_NAME:$(url_port "$(config_get target mint_url_2)")"
             version="$(curl -sf --max-time 3 "$(config_get target mint_url)/v1/info" 2>/dev/null | jq -r '.version // ""')"; image_digest="$(jq -r '.image_digest' "$STATE_DIR/session.json")"; cdk_sha="$(jq -r '.[] | select(.id=="cdk") | .sha' <<<"$SOURCES_JSON")"
             targets="$(jq -nc --arg a "$m1" --arg b "$m2" --arg sha "$cdk_sha" --arg version "$version" --arg image "$image_digest" '[{id:"mint-1",kind:"cashu-mint",url:$a,source_id:"cdk",source_sha:$sha,reported_version:$version,image_digest:$image},{id:"mint-2",kind:"cashu-mint",url:$b,source_id:"cdk",source_sha:$sha,reported_version:$version,image_digest:$image}]')"
-            reply_ok "$id" "$(jq -nc --argjson targets "$targets" --arg image "$image_digest" '{targets:$targets,tools:[{id:"cdk-cli",description:"session-scoped Cashu attacker wallet",path:"/opt/tools/cdk-cli"},{id:"python3",description:"Python 3 with Requests for protocol and HTTP PoCs",path:"/usr/bin/python3"},{id:"bash",description:"Bash runtime with curl, jq, SQLite, Git, and Perl available",path:"/usr/bin/bash"},{id:"poc-workspace",description:"writable session-scoped tmpfs for scripts and temporary output",path:"/work"}],limits:{max_payment_sats:100000},provenance:{image_digest:$image}}')" ;;
+            reply_ok "$id" "$(jq -nc --argjson targets "$targets" --arg image "$image_digest" '{targets:$targets,tools:[{id:"cdk-cli",description:"session-scoped Cashu attacker wallet",path:"/opt/tools/cdk-cli"},{id:"python3",description:"Python 3 with Requests and Coincurve for HTTP, protocol, and secp256k1/Schnorr PoCs",path:"/opt/venv/bin/python3"},{id:"bash",description:"Bash runtime with curl, jq, SQLite, Git, and Perl available",path:"/usr/bin/bash"},{id:"poc-workspace",description:"writable session-scoped tmpfs for scripts and temporary output",path:"/work"}],limits:{max_payment_sats:100000},provenance:{image_digest:$image}}')" ;;
         sandbox_exec)
             ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
             local command out rc; command="$(jq -r '.command // ""' <<<"$params")"; [ -n "$command" ] || { reply_error "$id" invalid_args "missing command" false; return; }

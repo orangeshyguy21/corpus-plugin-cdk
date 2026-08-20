@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.5 — 2026-08-20
+
+- Add pinned Coincurve 21.0.0 to the attacker sandbox for secp256k1 and BIP340
+  Schnorr PoCs.
+- Verify Schnorr signing and verification in the sandbox smoke test.
+
 ## 0.4.4 — 2026-08-19
 
 - Export the launcher work directory as `CDK_ITESTS_DIR`, matching the pinned
