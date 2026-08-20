@@ -27,7 +27,10 @@ this plugin.
 
 Docker Desktop or OrbStack, Nix, `jq`, `curl`, and Bash are required. Setup
 builds the shared attacker image and CDK client into Corpus-owned runtime
-state. When the configured mint ports are unused it launches CDK's pinned,
+state. The attacker gets Python with Requests for fast protocol scripting, a
+prebuilt CDK client, and a disposable writable `/work`; source and tool mounts
+remain read-only. When the configured
+mint ports are unused it launches CDK's pinned,
 non-interactive `start-regtest-mints` flake app and records the process and
 working tree beneath plugin state. If compatible mints are already listening,
 setup adopts them without taking teardown ownership. Session-specific gateway,
@@ -41,6 +44,8 @@ only a backbone launched by this plugin. An adopted backbone is never killed.
 
 - The attacker receives only the declared source mounts, tools, evidence
   directory, and target gateway.
+- `/work` is a writable tmpfs for PoC scripts and temporary output and is
+  removed with the sandbox.
 - Its testing network has no general internet egress.
 - Docker access, Lightning credentials, faucet implementation, environment
   locks, and oracle implementations remain host-side.

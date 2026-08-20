@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.4 — 2026-08-19
+
+- Export the launcher work directory as `CDK_ITESTS_DIR`, matching the pinned
+  integration harness's internal runtime contract as well as its CLI argument.
+
+## 0.4.3 — 2026-08-19
+
+- Apply a recorded compatibility patch to the pinned regtest launcher that
+  raises Bitcoin Core's JSON-RPC timeout during initial block generation.
+  This avoids false startup failures while preserving the pinned CDK source
+  and dependency lock.
+
+## 0.4.2 — 2026-08-19
+
+- Launch `start_regtest_mints` inside CDK's pinned `regtest` Nix environment
+  so `bitcoind`, Core Lightning, LND, and the other runtime daemons are on PATH.
+
+## 0.4.1 — 2026-08-19
+
+- Start the pinned CDK regtest package through its actual
+  `start_regtest_mints` binary instead of relying on Nix's incorrect inferred
+  main-program name.
+
+## 0.4.0 — 2026-08-19
+
+- Add Python 3 with Requests for rapid protocol scripting.
+- Add a disposable writable `/work` tmpfs while keeping the root filesystem,
+  source corpus, and tools read-only.
+- Advertise the available scripting runtimes and PoC workspace to agents.
+
 ## 0.3.8 — 2026-08-18
 
 - Let lifecycle setup start CDK's pinned non-interactive regtest when targets

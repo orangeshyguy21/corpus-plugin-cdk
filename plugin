@@ -8,7 +8,7 @@ CONF="$PLUGIN_DIR/config.toml"
 ORACLES_DIR="$PLUGIN_DIR/oracles"
 EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-90}"
 ORACLE_TIMEOUT_SECS="${CORPUS_ORACLE_TIMEOUT_SECS:-90}"
-AGENT_IMAGE="corpus-cdk-agent:0.3.8"
+AGENT_IMAGE="corpus-cdk-agent:0.4.4"
 
 reply_ok() { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
 reply_error() {
@@ -128,12 +128,19 @@ backbone_work_dir() {
     fi
 }
 start_backbone() {
-    local cdk_source="$1" pid log mint_addr mint_port_1 mint_port_2 waited=0
+    local cdk_source="$1" pid log mint_addr mint_port_1 mint_port_2 package_out executable nix_expr waited=0
     command -v nix >/dev/null 2>&1 || { printf '%s' "nix is required to start the pinned CDK regtest"; return 1; }
     mkdir -p "$BACKBONE_DIR"
     log="$STATE_DIR/backbone.log"
     mint_addr="127.0.0.1"; mint_port_1="$(url_port "$(config_get target mint_url)")"; mint_port_2="$(url_port "$(config_get target mint_url_2)")"
-    nohup nix run "$cdk_source#start-regtest-mints" -- \
+    nix_expr="let source = builtins.getFlake \"path:$cdk_source\"; package = source.packages.\${builtins.currentSystem}.start-regtest-mints; in package.overrideAttrs (old: { patches = (old.patches or []) ++ [ $PLUGIN_DIR/patches/bitcoin-rpc-timeout.patch ]; })"
+    if ! package_out="$(nix build --impure --no-link --print-out-paths --expr "$nix_expr" 2>"$log")"; then
+        printf 'could not build the pinned CDK regtest launcher; see %s' "$log"
+        return 1
+    fi
+    executable="$package_out/bin/start_regtest_mints"
+    [ -x "$executable" ] || { printf 'CDK regtest launcher missing at %s' "$executable"; return 1; }
+    nohup nix develop "$cdk_source#regtest" --command env "CDK_ITESTS_DIR=$BACKBONE_DIR" "$executable" \
         --enable-logging sqlite "$BACKBONE_DIR" "$mint_addr" "$mint_port_1" "$mint_port_2" \
         >"$log" 2>&1 </dev/null &
     pid=$!
@@ -209,7 +216,7 @@ doctor_result() {
 handle_setup() {
     local id="$1" params="$2" key result cdk_source out
     load_lifecycle_context "$params" || { reply_error "$id" invalid_context "setup requires an absolute state_dir" false; return; }
-    key="$(jq -r '.idempotency_key // "setup:cdk-regtest:0.3.8"' <<<"$params")"
+    key="$(jq -r '.idempotency_key // "setup:cdk-regtest:0.4.4"' <<<"$params")"
     progress "$id" dependency_fetch "default source locks verified" 1 5
     cdk_source="$(jq -r '.sources[]? | select(.id=="cdk") | .host_path' <<<"$params" | head -1)"
     [ -d "$cdk_source/.git" ] || { operation_failure "$key" source_missing "CDK source was not materialized by Corpus" true; reply_error "$id" source_missing "CDK source was not materialized by Corpus" true; return; }
@@ -292,7 +299,7 @@ handle() {
             m1="http://$GATEWAY_NAME:$(url_port "$(config_get target mint_url)")"; m2="http://$GATEWAY_NAME:$(url_port "$(config_get target mint_url_2)")"
             version="$(curl -sf --max-time 3 "$(config_get target mint_url)/v1/info" 2>/dev/null | jq -r '.version // ""')"; image_digest="$(jq -r '.image_digest' "$STATE_DIR/session.json")"; cdk_sha="$(jq -r '.[] | select(.id=="cdk") | .sha' <<<"$SOURCES_JSON")"
             targets="$(jq -nc --arg a "$m1" --arg b "$m2" --arg sha "$cdk_sha" --arg version "$version" --arg image "$image_digest" '[{id:"mint-1",kind:"cashu-mint",url:$a,source_id:"cdk",source_sha:$sha,reported_version:$version,image_digest:$image},{id:"mint-2",kind:"cashu-mint",url:$b,source_id:"cdk",source_sha:$sha,reported_version:$version,image_digest:$image}]')"
-            reply_ok "$id" "$(jq -nc --argjson targets "$targets" --arg image "$image_digest" '{targets:$targets,tools:[{id:"cdk-cli",description:"session-scoped Cashu attacker wallet",path:"/opt/tools/cdk-cli"}],limits:{max_payment_sats:100000},provenance:{image_digest:$image}}')" ;;
+            reply_ok "$id" "$(jq -nc --argjson targets "$targets" --arg image "$image_digest" '{targets:$targets,tools:[{id:"cdk-cli",description:"session-scoped Cashu attacker wallet",path:"/opt/tools/cdk-cli"},{id:"python3",description:"Python 3 with Requests for protocol and HTTP PoCs",path:"/usr/bin/python3"},{id:"bash",description:"Bash runtime with curl, jq, SQLite, Git, and Perl available",path:"/usr/bin/bash"},{id:"poc-workspace",description:"writable session-scoped tmpfs for scripts and temporary output",path:"/work"}],limits:{max_payment_sats:100000},provenance:{image_digest:$image}}')" ;;
         sandbox_exec)
             ensure_ready_session "$params" || { reply_error "$id" session_not_ready "session record is absent or not ready" true; return; }
             local command out rc; command="$(jq -r '.command // ""' <<<"$params")"; [ -n "$command" ] || { reply_error "$id" invalid_args "missing command" false; return; }

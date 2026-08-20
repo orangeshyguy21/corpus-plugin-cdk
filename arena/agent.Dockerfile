@@ -1,9 +1,8 @@
 # cdk-regtest attacker image (absorbed from the cdk PoC harness, 2026-08-10).
 #
-# Toolchain policy: bash + Rust-compiled binaries only. There is
-# intentionally NO Python (or any other interpreter) in this image.
-# Compiled attack tools (cdk-cli, custom Rust harnesses) are mounted
-# read-only at /opt/tools by `arena.sh agent`.
+# Toolchain policy: agents get Python for fast protocol/request scripting and
+# precompiled tools mounted read-only at /opt/tools. Native build toolchains do
+# not belong in the attacker image; CDK tools are compiled during setup.
 #
 # Hardening is applied at runtime (see arena.sh): dropped capabilities,
 # read-only root fs, no-new-privileges, resource caps. This Dockerfile only
@@ -17,6 +16,8 @@ RUN apt-get update \
         curl \
         git \
         jq \
+        python3 \
+        python3-requests \
         sqlite3 \
         socat \
         tini \

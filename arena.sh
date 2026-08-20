@@ -10,7 +10,7 @@ set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${CORPUS_CONFIG:-$PLUGIN_DIR/config.toml}"
-AGENT_IMAGE="${CORPUS_AGENT_IMAGE:-corpus-cdk-agent:0.3.8}"
+AGENT_IMAGE="${CORPUS_AGENT_IMAGE:-corpus-cdk-agent:0.4.4}"
 GW_NAME="${CORPUS_GATEWAY_NAME:-corpus-cdk-gateway-dev}"
 SANDBOX_NAME="${CORPUS_SANDBOX_NAME:-corpus-cdk-sandbox-dev}"
 EVIDENCE_DIR="${CORPUS_EVIDENCE_DIR:-${TMPDIR:-/tmp}/corpus-cdk-dev/evidence}"
@@ -232,6 +232,7 @@ cmd_agent() {
         --user attacker
         --read-only
         --tmpfs /tmp:rw,nosuid,nodev,size=512m
+        --tmpfs /work:rw,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700
         --cap-drop ALL
         --security-opt no-new-privileges
         --memory "$mem"

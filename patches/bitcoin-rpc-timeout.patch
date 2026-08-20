@@ -1,0 +1,49 @@
+diff --git a/crates/cdk-integration-tests/src/ln_regtest/bitcoin_client.rs b/crates/cdk-integration-tests/src/ln_regtest/bitcoin_client.rs
+index 1560f79..2802034 100644
+--- a/crates/cdk-integration-tests/src/ln_regtest/bitcoin_client.rs
++++ b/crates/cdk-integration-tests/src/ln_regtest/bitcoin_client.rs
+@@ -1,12 +1,13 @@
+ //! Bitcoind RPC Client
+ 
+ use std::path::PathBuf;
+ use std::str::FromStr;
+ use std::sync::Arc;
++use std::time::Duration;
+ 
+ use anyhow::Result;
+ use bitcoincore_rpc::bitcoin::{Address, Amount};
+-use bitcoincore_rpc::{Auth, Client, RpcApi};
++use bitcoincore_rpc::{Client, RpcApi};
+ 
+ /// Bitcoin client
+ #[derive(Clone)]
+@@ -26,17 +27,23 @@ impl BitcoinClient {
+     ) -> Result<Self> {
+         let addr = addr.join(format!("wallet/{}", wallet));
+ 
+-        let auth = match cookie_file {
+-            Some(path) => Auth::CookieFile(path),
+-            None => Auth::UserPass(user_name.unwrap(), password.unwrap()),
+-        };
+-
+         println!("{}", addr.display());
+ 
+-        let client = Client::new(&addr.display().to_string(), auth).unwrap();
++        // Generating the initial regtest chain can take longer than jsonrpc's
++        // 15-second default while Bitcoin Core processes wallet notifications.
++        let mut builder = bitcoincore_rpc::jsonrpc::simple_http::Builder::new()
++            .url(&addr.display().to_string())?
++            .timeout(Duration::from_secs(120));
++        builder = match cookie_file {
++            Some(path) => builder.cookie_auth(std::fs::read_to_string(path)?.trim()),
++            None => builder.auth(user_name.unwrap(), Some(password.unwrap())),
++        };
++        let transport = builder.build();
++        let jsonrpc = bitcoincore_rpc::jsonrpc::Client::with_transport(transport);
++        let client = Client::from_jsonrpc(jsonrpc);
+ 
+         Ok(Self {
+             client: Arc::new(client),
+             wallet,
+         })
+     }
