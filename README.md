@@ -37,6 +37,12 @@ setup adopts them without taking teardown ownership. Session-specific gateway,
 network, sandbox, evidence, and wallet resources are created and removed by
 the plugin.
 
+If an interrupted or crashed plugin-owned backbone is present but unhealthy,
+setup automatically quarantines its disposable work directory and retries once
+from a clean state. A failed clean retry restores the prior directory for
+diagnosis. Recovery refuses while live session resources exist, and an adopted
+external backbone is never stopped or moved.
+
 `corpus plugin stop cdk-regtest` refuses while sessions are live, then stops
 only a backbone launched by this plugin. An adopted backbone is never killed.
 

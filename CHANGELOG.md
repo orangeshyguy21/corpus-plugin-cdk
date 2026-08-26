@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.6 — 2026-08-26
+
+- Automatically quarantine and rebuild stale or partially initialized CDK
+  regtest state when setup finds the mint targets unhealthy.
+- Retry a failed first startup once from a clean work directory, restore the
+  previous topology if recovery also fails, and report both failures.
+- Show automatic backbone recovery as an explicit setup progress phase.
+- Refuse automatic recovery while a live environment session still owns
+  runtime resources; adopted external backbones are never signaled or moved.
+
 ## 0.4.5 — 2026-08-20
 
 - Add pinned Coincurve 21.0.0 to the attacker sandbox for secp256k1 and BIP340

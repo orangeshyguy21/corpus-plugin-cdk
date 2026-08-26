@@ -6,6 +6,7 @@ CORPUS_ROOT="${1:-$ROOT/../corpus}"
 VERSION="$(awk -F'"' '/^version = / {print $2; exit}' "$ROOT/plugin.toml")"
 
 bash -n "$ROOT/plugin" "$ROOT/arena.sh" "$ROOT/faucet.sh" "$ROOT/tools/build-tools.sh"
+"$ROOT/scripts/recovery-test.sh"
 
 hello="$(printf '%s\n' '{"id":1,"method":"hello","params":{}}' | "$ROOT/plugin")"
 jq -e '.id==1 and .ok==true and .result.protocol=="corpus.environment/1"' <<<"$hello" >/dev/null
