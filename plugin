@@ -8,7 +8,7 @@ CONF="$PLUGIN_DIR/config.toml"
 ORACLES_DIR="$PLUGIN_DIR/oracles"
 EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-90}"
 ORACLE_TIMEOUT_SECS="${CORPUS_ORACLE_TIMEOUT_SECS:-90}"
-AGENT_IMAGE="corpus-cdk-agent:0.4.5"
+AGENT_IMAGE="corpus-cdk-agent:0.4.6"
 
 reply_ok() { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
 reply_error() {
@@ -161,19 +161,106 @@ start_backbone() {
     return 1
 }
 stop_backbone() {
-    local pid command waited=0
-    [ -f "$BACKBONE_RECORD" ] || return 0
-    [ "$(jq -r '.ownership // ""' "$BACKBONE_RECORD")" = plugin ] || { rm -f "$BACKBONE_RECORD"; return 0; }
-    pid="$(jq -r '.pid // ""' "$BACKBONE_RECORD")"
-    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-    if kill -0 "$pid" 2>/dev/null; then
-        command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-        case "$command" in *"$BACKBONE_DIR"*) ;; *) return 1 ;; esac
-        kill -TERM "$pid" 2>/dev/null || true
-        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited+1)); done
-        kill -KILL "$pid" 2>/dev/null || true
+    local pid command waited=0 processes scoped_pids=""
+    if [ -f "$BACKBONE_RECORD" ]; then
+        [ "$(jq -r '.ownership // ""' "$BACKBONE_RECORD")" = plugin ] || { rm -f "$BACKBONE_RECORD"; return 0; }
+        pid="$(jq -r '.pid // ""' "$BACKBONE_RECORD")"
+        case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+        if kill -0 "$pid" 2>/dev/null; then
+            command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+            case "$command" in *"$BACKBONE_DIR"*) ;; *) return 1 ;; esac
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
     fi
+
+    # The CDK launcher normally reaps its children, but an abrupt host crash
+    # can orphan a daemon after the wrapper PID is gone. Match only processes
+    # whose command contains this plugin's exact absolute work directory.
+    processes="$(ps -axo pid=,command= 2>/dev/null || true)"
+    while read -r pid command; do
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ] || continue
+        case "$command" in *"$BACKBONE_DIR"*) scoped_pids="$scoped_pids $pid" ;; esac
+    done <<<"$processes"
+    for pid in $scoped_pids; do kill -TERM "$pid" 2>/dev/null || true; done
+    while [ "$waited" -lt 30 ]; do
+        local alive=false
+        for pid in $scoped_pids; do kill -0 "$pid" 2>/dev/null && alive=true; done
+        [ "$alive" = true ] || break
+        sleep 1; waited=$((waited+1))
+    done
+    for pid in $scoped_pids; do kill -KILL "$pid" 2>/dev/null || true; done
     rm -f "$BACKBONE_RECORD"
+}
+active_session_count() {
+    local active=0 record gateway sandbox
+    for record in "$STATE_DIR"/state/*/session.json; do
+        [ -f "$record" ] || continue
+        [ "$(jq -r '.state' "$record")" = ready ] || continue
+        gateway="$(jq -r '.gateway' "$record")"
+        sandbox="$(jq -r '.sandbox' "$record")"
+        if docker inspect "$gateway" >/dev/null 2>&1 || docker inspect "$sandbox" >/dev/null 2>&1; then
+            active=$((active+1))
+        fi
+    done
+    printf '%s' "$active"
+}
+backbone_has_local_state() {
+    [ -f "$BACKBONE_RECORD" ] ||
+        { [ -d "$BACKBONE_DIR" ] && [ -n "$(find "$BACKBONE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; }
+}
+reset_and_start_backbone() {
+    local cdk_source="$1" active owner old_record="" quarantine out
+    active="$(active_session_count)"
+    if [ "$active" -gt 0 ]; then
+        printf 'CDK backbone is unhealthy, but %s active environment session(s) prevent automatic rebuild' "$active"
+        return 1
+    fi
+
+    owner="$(jq -r '.ownership // "unknown"' "$BACKBONE_RECORD" 2>/dev/null || printf '%s' absent)"
+    [ -f "$BACKBONE_RECORD" ] && old_record="$(cat "$BACKBONE_RECORD")"
+    if [ "$owner" = adopted ]; then
+        # The external process is no longer serving the configured targets.
+        # Forget the adoption record, but never signal or move external state.
+        rm -f "$BACKBONE_RECORD"
+    elif ! stop_backbone; then
+        printf 'could not stop the stale plugin-owned CDK regtest before rebuilding'
+        return 1
+    fi
+
+    quarantine="${BACKBONE_DIR}.failed.$(date -u +%Y%m%dT%H%M%SZ).$$"
+    if [ -e "$BACKBONE_DIR" ]; then mv "$BACKBONE_DIR" "$quarantine"; fi
+    if out="$(start_backbone "$cdk_source")"; then
+        [ ! -e "$quarantine" ] || rm -rf -- "$quarantine"
+        return 0
+    fi
+
+    # A clean retry failed. Preserve that diagnostic in the setup response,
+    # then restore the prior topology so automatic repair is transactional.
+    stop_backbone >/dev/null 2>&1 || true
+    [ ! -e "$BACKBONE_DIR" ] || rm -rf -- "$BACKBONE_DIR"
+    if [ -e "$quarantine" ]; then mv "$quarantine" "$BACKBONE_DIR"; fi
+    [ -z "$old_record" ] || atomic_json "$BACKBONE_RECORD" "$old_record"
+    printf 'fresh CDK backbone initialization failed: %s' "$out"
+    return 1
+}
+ensure_backbone() {
+    local cdk_source="$1" first_error recovery_error
+    if targets_ready; then
+        if [ ! -f "$BACKBONE_RECORD" ]; then
+            atomic_json "$BACKBONE_RECORD" "$(jq -nc --arg work_dir "$(external_work_dir)" '{ownership:"adopted",work_dir:$work_dir,state:"ready"}')"
+        fi
+        return 0
+    fi
+
+    if backbone_has_local_state; then
+        reset_and_start_backbone "$cdk_source"
+        return
+    fi
+    if first_error="$(start_backbone "$cdk_source")"; then return 0; fi
+    if recovery_error="$(reset_and_start_backbone "$cdk_source")"; then return 0; fi
+    printf 'initial CDK backbone startup failed: %s; automatic clean retry failed: %s' "$first_error" "$recovery_error"
+    return 1
 }
 run_arena() {
     CORPUS_AGENT_IMAGE="$AGENT_IMAGE" CORPUS_ARENA_NETWORK="$ARENA_NETWORK" \
@@ -216,7 +303,7 @@ doctor_result() {
 handle_setup() {
     local id="$1" params="$2" key result cdk_source out
     load_lifecycle_context "$params" || { reply_error "$id" invalid_context "setup requires an absolute state_dir" false; return; }
-    key="$(jq -r '.idempotency_key // "setup:cdk-regtest:0.4.4"' <<<"$params")"
+    key="$(jq -r '.idempotency_key // "setup:cdk-regtest:0.4.6"' <<<"$params")"
     progress "$id" dependency_fetch "default source locks verified" 1 5
     cdk_source="$(jq -r '.sources[]? | select(.id=="cdk") | .host_path' <<<"$params" | head -1)"
     [ -d "$cdk_source/.git" ] || { operation_failure "$key" source_missing "CDK source was not materialized by Corpus" true; reply_error "$id" source_missing "CDK source was not materialized by Corpus" true; return; }
@@ -231,11 +318,10 @@ handle_setup() {
         cp "$STATE_DIR/faucet-target/release/corpus-faucet" "$STATE_DIR/corpus-faucet"; chmod 755 "$STATE_DIR/corpus-faucet"
     fi
     progress "$id" target_start "starting pinned CDK regtest when absent" 4 5
-    if targets_ready; then
-        if [ ! -f "$BACKBONE_RECORD" ]; then
-            atomic_json "$BACKBONE_RECORD" "$(jq -nc --arg work_dir "$(external_work_dir)" '{ownership:"adopted",work_dir:$work_dir,state:"ready"}')"
-        fi
-    elif ! out="$(start_backbone "$cdk_source")"; then
+    if ! targets_ready && backbone_has_local_state; then
+        progress "$id" target_recovery "unhealthy CDK backbone detected; rebuilding disposable regtest state" 4 5
+    fi
+    if ! out="$(ensure_backbone "$cdk_source")"; then
         operation_failure "$key" target_start_failed "$out" true; reply_error "$id" target_start_failed "$out" true; return
     fi
     progress "$id" verification "checking Docker, tools, targets, and oracle prerequisites" 5 5
@@ -282,8 +368,7 @@ handle() {
             if [ "$(jq -r '.ready' <<<"$health")" = true ]; then reply_ok "$id" "$health"; else reply_error "$id" unhealthy "$(jq -r '.notes' <<<"$health")" true; fi ;;
         stop)
             load_lifecycle_context "$params" || { reply_error "$id" invalid_context "stop requires state_dir" false; return; }
-            local active=0 record gateway sandbox
-            for record in "$STATE_DIR"/state/*/session.json; do [ -f "$record" ] || continue; [ "$(jq -r '.state' "$record")" = ready ] || continue; gateway="$(jq -r '.gateway' "$record")"; sandbox="$(jq -r '.sandbox' "$record")"; if docker inspect "$gateway" >/dev/null 2>&1 || docker inspect "$sandbox" >/dev/null 2>&1; then active=$((active+1)); fi; done
+            local active; active="$(active_session_count)"
             if [ "$active" -gt 0 ]; then reply_error "$id" sessions_active "$active environment session(s) are still active" true
             elif stop_backbone; then reply_ok "$id" '{"stopped":true}'
             else reply_error "$id" cleanup_failed "could not stop the plugin-owned CDK regtest" true; fi ;;
