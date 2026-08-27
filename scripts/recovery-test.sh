@@ -2,12 +2,41 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export CORPUS_SETUP_HEARTBEAT_SECS=0.01
 # Loading the adapter with closed stdin defines its functions without handling
 # a protocol request. Every host interaction used below is replaced by a fake.
 # shellcheck source=../plugin
 source "$ROOT/plugin" </dev/null
 
 fail() { echo "recovery-test: $*" >&2; exit 1; }
+
+# A durable backbone must not share the adapter process group. Corpus kills
+# that group when the lifecycle process exits, while this child must survive.
+DETACH_LOG="$(mktemp "${TMPDIR:-/tmp}/corpus-cdk-detach.XXXXXX")"
+launch_detached "$DETACH_LOG" sleep 30
+child_pid="$DETACHED_PID"
+parent_group="$(ps -p $$ -o pgid= | tr -d ' ')"
+child_group="$(ps -p "$child_pid" -o pgid= | tr -d ' ')"
+if [ -z "$child_group" ] || [ "$child_group" = "$parent_group" ]; then
+    kill "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+    rm -f "$DETACH_LOG"
+    fail "durable backbone remained in the adapter process group"
+fi
+kill "$child_pid"
+wait "$child_pid" 2>/dev/null || true
+rm -f "$DETACH_LOG"
+
+HEARTBEAT_LOG="$(mktemp "${TMPDIR:-/tmp}/corpus-cdk-heartbeat.XXXXXX")"
+progress_heartbeat 17 >"$HEARTBEAT_LOG" &
+heartbeat_pid=$!
+sleep 0.04
+kill "$heartbeat_pid" 2>/dev/null || true
+wait "$heartbeat_pid" 2>/dev/null || true
+jq -e -s 'length > 0 and all(.[]; .id == 17 and .event == "progress" and .phase == "target_wait")' \
+    "$HEARTBEAT_LOG" >/dev/null || fail "setup heartbeat did not emit valid progress frames"
+rm -f "$HEARTBEAT_LOG"
+
 new_fixture() {
     TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/corpus-cdk-recovery.XXXXXX")"
     STATE_DIR="$TEST_ROOT/state"
