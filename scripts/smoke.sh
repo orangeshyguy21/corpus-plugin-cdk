@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CORPUS_ROOT="${1:-$ROOT/../corpus}"
 export CORPUS_PLUGINS_DIR="$(dirname "$ROOT")"
-IMAGE="corpus-cdk-agent:0.4.6"
+IMAGE="corpus-cdk-agent:0.4.8"
 
 cargo run -q --manifest-path "$CORPUS_ROOT/Cargo.toml" -p corpus-cli -- plugin doctor cdk-regtest
 
