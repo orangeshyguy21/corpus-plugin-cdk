@@ -8,6 +8,7 @@ CONF="$PLUGIN_DIR/config.toml"
 ORACLES_DIR="$PLUGIN_DIR/oracles"
 EXEC_TIMEOUT_SECS="${CORPUS_EXEC_TIMEOUT_SECS:-90}"
 ORACLE_TIMEOUT_SECS="${CORPUS_ORACLE_TIMEOUT_SECS:-90}"
+SETUP_HEARTBEAT_SECS="${CORPUS_SETUP_HEARTBEAT_SECS:-15}"
 AGENT_IMAGE="corpus-cdk-agent:0.4.6"
 
 reply_ok() { printf '{"id":%s,"ok":true,"result":%s}\n' "$1" "$2"; }
@@ -20,6 +21,12 @@ progress() {
     jq -nc --argjson id "$1" --arg phase "$2" --arg message "$3" \
         --argjson completed "$4" --argjson total "$5" \
         '{id:$id,event:"progress",phase:$phase,message:$message,completed:$completed,total:$total}'
+}
+progress_heartbeat() {
+    local id="$1"
+    while sleep "$SETUP_HEARTBEAT_SECS"; do
+        progress "$id" target_wait "CDK regtest is still initializing; topology logs remain active" 4 5
+    done
 }
 
 config_get() {
@@ -127,6 +134,17 @@ backbone_work_dir() {
         external_work_dir
     fi
 }
+launch_detached() {
+    local log="$1"
+    shift
+    # Corpus owns the plugin process group and terminates it when a lifecycle
+    # call ends. Job control gives this durable backbone a distinct process
+    # group without adding a platform-specific setsid dependency.
+    set -m
+    nohup "$@" >"$log" 2>&1 </dev/null &
+    DETACHED_PID=$!
+    set +m
+}
 start_backbone() {
     local cdk_source="$1" pid log mint_addr mint_port_1 mint_port_2 package_out executable nix_expr waited=0
     command -v nix >/dev/null 2>&1 || { printf '%s' "nix is required to start the pinned CDK regtest"; return 1; }
@@ -140,10 +158,10 @@ start_backbone() {
     fi
     executable="$package_out/bin/start_regtest_mints"
     [ -x "$executable" ] || { printf 'CDK regtest launcher missing at %s' "$executable"; return 1; }
-    nohup nix develop "$cdk_source#regtest" --command env "CDK_ITESTS_DIR=$BACKBONE_DIR" "$executable" \
-        --enable-logging sqlite "$BACKBONE_DIR" "$mint_addr" "$mint_port_1" "$mint_port_2" \
-        >"$log" 2>&1 </dev/null &
-    pid=$!
+    launch_detached "$log" nix develop "$cdk_source#regtest" --command env \
+        "CDK_ITESTS_DIR=$BACKBONE_DIR" "$executable" --enable-logging sqlite \
+        "$BACKBONE_DIR" "$mint_addr" "$mint_port_1" "$mint_port_2"
+    pid="$DETACHED_PID"
     atomic_json "$BACKBONE_RECORD" "$(jq -nc --argjson pid "$pid" --arg work_dir "$BACKBONE_DIR" --arg log "$log" '{ownership:"plugin",pid:$pid,work_dir:$work_dir,log:$log,state:"starting"}')"
     while [ "$waited" -lt 300 ]; do
         if targets_ready && [ -f "$BACKBONE_DIR/.ready" ]; then
@@ -301,7 +319,7 @@ doctor_result() {
 }
 
 handle_setup() {
-    local id="$1" params="$2" key result cdk_source out
+    local id="$1" params="$2" key result cdk_source out heartbeat_pid setup_rc
     load_lifecycle_context "$params" || { reply_error "$id" invalid_context "setup requires an absolute state_dir" false; return; }
     key="$(jq -r '.idempotency_key // "setup:cdk-regtest:0.4.6"' <<<"$params")"
     progress "$id" dependency_fetch "default source locks verified" 1 5
@@ -321,7 +339,11 @@ handle_setup() {
     if ! targets_ready && backbone_has_local_state; then
         progress "$id" target_recovery "unhealthy CDK backbone detected; rebuilding disposable regtest state" 4 5
     fi
-    if ! out="$(ensure_backbone "$cdk_source")"; then
+    progress_heartbeat "$id" & heartbeat_pid=$!
+    if out="$(ensure_backbone "$cdk_source")"; then setup_rc=0; else setup_rc=$?; fi
+    kill "$heartbeat_pid" 2>/dev/null || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+    if [ "$setup_rc" -ne 0 ]; then
         operation_failure "$key" target_start_failed "$out" true; reply_error "$id" target_start_failed "$out" true; return
     fi
     progress "$id" verification "checking Docker, tools, targets, and oracle prerequisites" 5 5
